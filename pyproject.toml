@@ -7,7 +7,7 @@ src = ["src", "generator", "tests"]
 select = ["E", "F", "I", "B", "UP", "S", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["webhook", "generator", "tests"]
+known-first-party = ["webhook", "firehose_transform", "generator", "tests"]
 
 [tool.ruff.lint.per-file-ignores]
 # asserts and hard-coded test secrets are fine in tests

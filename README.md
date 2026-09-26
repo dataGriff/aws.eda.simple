@@ -5,7 +5,9 @@ A small, complete event-driven architecture on AWS:
 1. A **fake data generator** (local Python script) POSTs synthetic shop events to a webhook.
 2. The webhook is a **Lambda function exposed through a Function URL**, protected by a shared-secret header.
 3. The Lambda validates the events and publishes them to a **custom Amazon EventBridge bus** with `PutEvents`.
-4. A **catch-all rule** on the bus copies every event to a **CloudWatch log group**, so you can watch the pipeline work end-to-end without writing a consumer.
+4. A **catch-all rule** on the bus fans every event out to two targets: a **CloudWatch log group** so you can watch the pipeline work, and an **Amazon Data Firehose** stream so you can keep the events.
+5. Firehose reshapes each event with a small transform Lambda and lands it in an **Apache Iceberg table on S3**, registered in the **Glue Data Catalog**.
+6. You query the table with **DuckDB** — or Athena, Spark, Trino or PyIceberg, since it is a plain Iceberg table.
 
 ```mermaid
 flowchart LR
@@ -13,22 +15,29 @@ flowchart LR
     U --> L[WebhookFunction<br/>validate + batch]
     L -- "PutEvents (≤10 per call)" --> B[(EventBridge bus<br/>simple-eda-bus)]
     B -- "CatchAllRule<br/>source = com.example.shop" --> C[CloudWatch Logs<br/>/aws/events/simple-eda-bus]
+    B -- "CatchAllRule<br/>same pattern, 2nd target" --> F[Firehose<br/>buffer 60s]
+    F --> T[FirehoseTransformFunction<br/>envelope → row]
+    T --> I[(Iceberg table<br/>s3://…/events/)]
+    I --> D[DuckDB<br/>iceberg_scan]
+    F -. "failed records" .-> E[s3://…/errors/]
 ```
 
-Everything is deployed with **AWS SAM** from a single `template.yaml`. The Lambda has **no third-party dependencies** (boto3 ships with the runtime).
+Everything is deployed with **AWS SAM** from a single `template.yaml`, with no manual prerequisites beyond AWS credentials. Both Lambdas have **no third-party dependencies** (boto3 ships with the runtime, and the transform needs only the standard library).
 
 ## Project layout
 
 ```
-template.yaml               SAM template: bus, Lambda + Function URL, IAM, rule, log groups
-samconfig.toml              SAM CLI defaults (stack name, region, non-secret parameters)
-Makefile                    install / lint / test / build / deploy / generate / logs / delete
-src/webhook/app.py          Lambda handler and pure helper functions
-generator/generate.py       Fake data generator CLI (runs locally, not deployed)
-tests/                      pytest unit tests (botocore Stubber, no AWS account needed)
-events/post.json            Sample Function URL event for `sam local invoke`
-env.example.json            Template for local env vars (copy to env.json, git-ignored)
-.github/workflows/ci.yml    Lint + tests + `sam validate --lint`
+template.yaml                 SAM template: bus, Lambdas, IAM, rule, log groups, bucket, Glue table, Firehose
+samconfig.toml                SAM CLI defaults (stack name, region, non-secret parameters)
+Makefile                      install / lint / test / build / deploy / generate / logs / duckdb / delete
+src/webhook/app.py            Webhook handler and pure helper functions
+src/firehose_transform/app.py Firehose transform: EventBridge envelope -> Iceberg table row
+generator/generate.py         Fake data generator CLI (runs locally, not deployed)
+tests/                        pytest unit tests (botocore Stubber, no AWS account needed)
+events/post.json              Sample Function URL event for `sam local invoke`
+events/firehose.json          Sample Firehose records event for `sam local invoke`
+env.example.json              Template for local env vars (copy to env.json, git-ignored)
+.github/workflows/ci.yml      Lint + tests + `sam validate --lint`
 ```
 
 ## Event contract
@@ -67,6 +76,9 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 - An AWS account and credentials configured for the AWS CLI
 - [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 - Python 3.12 (3.11 also works for local tests) and `make`
+- Optional, to query the Iceberg table: the [DuckDB CLI](https://duckdb.org/docs/installation/) (`brew install duckdb`)
+
+No account-level setup is needed — no Lake Formation, no Glue integration to enable. `make deploy` is the whole story.
 
 ## Setup
 
@@ -138,11 +150,79 @@ curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
      -d '{"id":"evt_1","type":"order.created","timestamp":"2026-09-26T14:47:03Z","data":{"order_id":"ord_1"}}'  # 202
 ```
 
+## Query the events in the Iceberg table
+
+Firehose buffers for 60 seconds, so give it a minute after `make generate`, then:
+
+```bash
+make errors             # should print nothing: anything here failed to deliver
+make duckdb             # opens DuckDB with an `events` view over the table
+```
+
+```sql
+SELECT count(*) FROM events;
+SELECT event_type, count(*) FROM events GROUP BY 1 ORDER BY 2 DESC;
+
+SELECT event_time,
+       event_type,
+       json_extract_string(detail, '$.data.order_id')          AS order_id,
+       CAST(json_extract_string(detail, '$.data.total') AS DOUBLE) AS total
+FROM   events
+WHERE  event_type = 'order.created'
+ORDER  BY event_time DESC
+LIMIT  10;
+```
+
+`make duckdb` is a thin wrapper over the catalog-free read path, which needs nothing but S3 read permission:
+
+```sql
+INSTALL httpfs; INSTALL iceberg; LOAD iceberg;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'eu-west-1');
+SELECT * FROM iceberg_scan('s3://<bucket>/events/', allow_moved_paths = true);
+```
+
+DuckDB can also `ATTACH` the Glue catalog itself (`TYPE iceberg, ENDPOINT_TYPE glue`) if you would rather
+address the table by name. Either way it is an ordinary Iceberg table, so Athena, Spark, Trino and
+PyIceberg read it with no extra setup.
+
+### Table schema
+
+Six columns. The envelope is flattened into typed columns and the payload is kept as raw JSON, so a new
+event type or a new field inside `data` can never break ingestion.
+
+| Column | Type | From |
+|---|---|---|
+| `event_id` | string | `detail.id` — the business event id (`evt_…`) |
+| `event_type` | string | EventBridge `detail-type` |
+| `source` | string | EventBridge `source` |
+| `event_time` | timestamp | EventBridge `time`, normalised to UTC |
+| `ingest_time` | timestamp | set by the transform; `ingest_time - event_time` is pipeline lag |
+| `detail` | string | the whole inbound event as JSON |
+
+The table is **unpartitioned**: CloudFormation can only express Hive-style partition keys for a Glue
+table, not an Iceberg partition spec. Add one when it earns its keep, from any Iceberg engine:
+
+```sql
+ALTER TABLE shop_events.events ADD PARTITION FIELD day(event_time);
+```
+
+### Compaction
+
+Firehose commits every 60 seconds, so the table accumulates small Parquet files. Compaction is
+deliberately **not** enabled: it bills Glue DPU hours, and at a few events per second it would run
+continuously over a toy dataset for no query benefit. When there is enough data for file count to hurt,
+add one resource — `AWS::Glue::TableOptimizer` with a `binpack` `CompactionConfiguration`, plus an IAM
+role for Glue to run it. Matching optimizers exist for snapshot retention and orphan-file removal.
+
 ## Local development
 
 - `make lint`, `make fmt`, `make test`, `make validate` (`sam validate --lint`).
-- `make invoke-local` runs the handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. Note that the handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
+- `make invoke-local` runs the webhook handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. Note that the handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
+- `make invoke-local-transform` runs the Firehose transform with `events/firehose.json`. This one calls no AWS APIs at all, so it works **fully offline** and prints the exact rows Firehose would write.
 - `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
+
+Firehose itself cannot be run locally, so the buffered write and the Iceberg commit are only exercised in
+AWS. Everything either side of it is covered by `make test` and the two local invokes.
 
 ## Security notes
 
@@ -150,12 +230,17 @@ curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
 - The secret is stored as a Lambda environment variable (`NoEcho` in CloudFormation). For production, move it to SSM Parameter Store or Secrets Manager, or switch the Function URL to `AuthType: AWS_IAM`.
 - The function's IAM role can only call `events:PutEvents` on this one bus.
 - If you need WAF, throttling or custom domains, put an API Gateway HTTP API in front of the function instead of a Function URL.
+- The lake bucket blocks all public access and is encrypted with SSE-S3. The Firehose role can only touch that one bucket, that one Glue table and the transform function; the EventBridge target role can only put records to that one stream.
 
 ## Tear down
 
 ```bash
+make empty-bucket       # required: CloudFormation cannot delete a bucket that still has objects
 make delete             # sam delete, removes the stack including log groups and the resource policy
 ```
+
+`make empty-bucket` deletes the Iceberg table data, so it is deliberately a separate step rather than
+chained into `make delete`. Nothing is left behind in the account afterwards.
 
 ## How it works (implementation notes)
 

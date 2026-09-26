@@ -2,8 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   aws.eda.simple - a webhook Lambda (Function URL) that publishes inbound JSON events
-  to a custom Amazon EventBridge bus. A catch-all rule forwards every event to a
-  CloudWatch log group so the pipeline can be observed end-to-end.
+  to a custom Amazon EventBridge bus. A catch-all rule fans every event out to a
+  CloudWatch log group (so the pipeline can be observed end-to-end) and to an Amazon
+  Data Firehose stream that lands it in an Apache Iceberg table on S3.
 
 Parameters:
   WebhookSecret:
@@ -22,7 +23,19 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 7
-    Description: Retention for the Lambda and event log groups.
+    Description: Retention for the Lambda, event and Firehose log groups.
+  GlueDatabaseName:
+    Type: String
+    Default: shop_events
+    AllowedPattern: "[a-z0-9_]+"
+    Description: >
+      Glue database holding the Iceberg table. Underscores only - the Iceberg library
+      Firehose uses rejects hyphens in database and table names.
+  GlueTableName:
+    Type: String
+    Default: events
+    AllowedPattern: "[a-z0-9_]+"
+    Description: Name of the Iceberg table receiving every event on the bus.
 
 Globals:
   Function:
@@ -99,12 +112,14 @@ Resources:
           ]
         }
 
+  # One rule, two targets: the log group for watching, Firehose for keeping.
+  # Targets are independent, so a permission problem on one cannot stop the other.
   CatchAllRule:
     Type: AWS::Events::Rule
     DependsOn: EventsLogGroupPolicy
     Properties:
-      Name: !Sub ${BusName}-catch-all-to-logs
-      Description: Forward every event published by the webhook to CloudWatch Logs.
+      Name: !Sub ${BusName}-catch-all
+      Description: Fan every event published by the webhook out to CloudWatch Logs and Firehose.
       EventBusName: !Ref EventBus
       State: ENABLED
       # An empty pattern {} is rejected; matching on our source is effectively catch-all.
@@ -114,6 +129,228 @@ Resources:
       Targets:
         - Id: events-log-group
           Arn: !GetAtt EventsLogGroup.Arn
+        # Same lesson as the log group above, via IAM rather than a resource policy:
+        # without this role the target deploys but silently delivers nothing.
+        - Id: events-firehose
+          Arn: !GetAtt EventsFirehose.Arn
+          RoleArn: !GetAtt EventBridgeToFirehoseRole.Arn
+
+  EventBridgeToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: put-records-to-firehose
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt EventsFirehose.Arn
+
+  # ------------------------------------------------------------------ Lake storage
+  # events/ holds the Iceberg table, errors/ holds records Firehose could not deliver.
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-lake-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  EventsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Events captured from the EventBridge bus.
+
+  # Iceberg table created by Glue itself (MetadataOperation: CREATE writes the Iceberg
+  # metadata under the location). Firehose only delivers to genuine Iceberg tables.
+  # Unpartitioned: CloudFormation cannot express an Iceberg partition spec here, only
+  # Hive-style PartitionKeys, which is a different thing. Add one later with
+  # ALTER TABLE ... ADD PARTITION FIELD from any Iceberg engine.
+  EventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref EventsDatabase
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: "2"
+      TableInput:
+        Name: !Ref GlueTableName
+        Description: One row per event on the bus; detail holds the payload as JSON.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          table_type: ICEBERG
+        StorageDescriptor:
+          Location: !Sub s3://${LakeBucket}/events/
+          Columns:
+            - Name: event_id
+              Type: string
+              Comment: detail.id - the business event id
+            - Name: event_type
+              Type: string
+              Comment: EventBridge detail-type
+            - Name: source
+              Type: string
+            - Name: event_time
+              Type: timestamp
+            - Name: ingest_time
+              Type: timestamp
+              Comment: set by the transform Lambda; event_time minus this is pipeline lag
+            - Name: detail
+              Type: string
+              Comment: the whole inbound event as JSON, so new payload fields never break ingestion
+
+  # ------------------------------------------------------------------ Firehose
+  # Firehose maps only the first level of a record's JSON to columns, and the bus
+  # envelope nests the event under "detail". This function flattens it.
+  FirehoseTransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Reshapes EventBridge envelopes into rows matching the Iceberg table.
+      CodeUri: src/firehose_transform/
+      Handler: app.lambda_handler
+      # Firehose expects a transform to answer well within its own 5 minute budget.
+      Timeout: 60
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+
+  FirehoseTransformFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FirehoseTransformFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/kinesisfirehose/${AWS::StackName}-events-to-iceberg
+      RetentionInDays: !Ref LogRetentionDays
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: IcebergDelivery
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deliver-to-iceberg-table
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Firehose commits Iceberg snapshots by updating the table in the catalog.
+              - Sid: IcebergCatalogCommits
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}
+              - Sid: WriteTableDataAndErrors
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt LakeBucket.Arn
+                  - !Sub ${LakeBucket.Arn}/*
+              - Sid: InvokeTransform
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt FirehoseTransformFunction.Arn
+                  - !Sub ${FirehoseTransformFunction.Arn}:*
+              - Sid: WriteDeliveryLogs
+                Effect: Allow
+                Action: logs:PutLogEvents
+                Resource: !GetAtt FirehoseLogGroup.Arn
+
+  EventsFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub ${AWS::StackName}-events-to-iceberg
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt FirehoseRole.Arn
+        CatalogConfiguration:
+          CatalogArn: !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+        # Inserts only, no updates or deletes, which lets Firehose scale throughput.
+        AppendOnly: true
+        DestinationTableConfigurationList:
+          - DestinationDatabaseName: !Ref GlueDatabaseName
+            DestinationTableName: !Ref GlueTableName
+        # One Iceberg commit per flush: 60s keeps the demo responsive at the cost of
+        # small Parquet files. See "Compaction" in the README.
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseTransformFunction.Arn
+        RetryOptions:
+          DurationInSeconds: 300
+        # Required even for an Iceberg destination: this is where records Firehose
+        # could not deliver land, with the reason attached.
+        S3Configuration:
+          BucketARN: !GetAtt LakeBucket.Arn
+          RoleARN: !GetAtt FirehoseRole.Arn
+          ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/'
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
 
 Outputs:
   WebhookUrl:
@@ -128,3 +365,15 @@ Outputs:
   LogGroupName:
     Description: Log group receiving a copy of every event on the bus.
     Value: !Ref EventsLogGroup
+  LakeBucketName:
+    Description: Bucket holding the Iceberg table (events/) and delivery failures (errors/).
+    Value: !Ref LakeBucket
+  TableLocation:
+    Description: S3 URI of the Iceberg table - point DuckDB's iceberg_scan at this.
+    Value: !Sub s3://${LakeBucket}/events/
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+  GlueTableName:
+    Value: !Ref GlueTableName
+  FirehoseStreamName:
+    Value: !Ref EventsFirehose

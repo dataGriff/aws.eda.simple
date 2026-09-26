@@ -8,9 +8,11 @@ from botocore.stub import Stubber
 
 from tests.helpers import SECRET
 
-os.environ.setdefault("WEBHOOK_SECRET", SECRET)
-os.environ.setdefault("EVENT_BUS_NAME", "test-bus")
-os.environ.setdefault("EVENT_SOURCE", "com.example.test")
+# Assigned, not setdefault: a real WEBHOOK_SECRET exported for `make deploy` must not
+# leak into the tests, or every authorized request would come back 401.
+os.environ["WEBHOOK_SECRET"] = SECRET
+os.environ["EVENT_BUS_NAME"] = "test-bus"
+os.environ["EVENT_SOURCE"] = "com.example.test"
 os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
