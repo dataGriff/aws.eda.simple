@@ -173,17 +173,24 @@ ORDER  BY event_time DESC
 LIMIT  10;
 ```
 
-`make duckdb` is a thin wrapper over the catalog-free read path, which needs nothing but S3 read permission:
+`make duckdb` is a thin wrapper over an `ATTACH` of the Glue catalog. IAM is the only thing gating it —
+there is no Lake Formation in the picture:
 
 ```sql
-INSTALL httpfs; INSTALL iceberg; LOAD iceberg;
+INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg;
 CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'eu-west-1');
-SELECT * FROM iceberg_scan('s3://<bucket>/events/', allow_moved_paths = true);
+ATTACH '<account-id>' AS lake (TYPE iceberg, ENDPOINT_TYPE glue);
+SELECT * FROM lake.shop_events.events;
 ```
 
-DuckDB can also `ATTACH` the Glue catalog itself (`TYPE iceberg, ENDPOINT_TYPE glue`) if you would rather
-address the table by name. Either way it is an ordinary Iceberg table, so Athena, Spark, Trino and
-PyIceberg read it with no extra setup.
+The catalog is what makes this work: it holds the pointer to the table's current metadata file. Reading
+straight from the prefix instead — `iceberg_scan('s3://<bucket>/events/')` — fails with *"no version was
+provided and no version-hint could be found"*, because DuckDB will not guess the latest snapshot unless
+you set `unsafe_enable_version_guessing`. Point `iceberg_scan` at a specific
+`events/metadata/*.metadata.json` if you want a catalog-free read of a known snapshot.
+
+Either way it is an ordinary Iceberg table, so Athena, Spark, Trino and PyIceberg read it with no extra
+setup.
 
 ### Table schema
 

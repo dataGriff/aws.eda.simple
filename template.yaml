@@ -204,8 +204,8 @@ Resources:
         Name: !Ref GlueTableName
         Description: One row per event on the bus; detail holds the payload as JSON.
         TableType: EXTERNAL_TABLE
-        Parameters:
-          table_type: ICEBERG
+        # No table_type/metadata_location here: Glue sets both itself when
+        # MetadataOperation is CREATE, and rejects them as reserved parameters.
         StorageDescriptor:
           Location: !Sub s3://${LakeBucket}/events/
           Columns:

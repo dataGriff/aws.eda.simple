@@ -80,15 +80,17 @@ logs-events: ## Tail the events delivered to the bus (via the catch-all rule)
 logs-firehose: ## Tail the Firehose delivery logs (errors show up here first)
 	aws logs tail /aws/kinesisfirehose/$(STACK)-events-to-iceberg --region $(REGION) --follow --format short
 
-errors: ## List records Firehose could not deliver (should print nothing)
-	@aws s3 ls "s3://$$($(MAKE) -s bucket)/errors/" --recursive --region $(REGION)
+errors: ## List records Firehose could not deliver (should report none)
+	@aws s3 ls "s3://$$($(MAKE) -s bucket)/errors/" --recursive --region $(REGION) \
+		|| echo "no delivery errors"
 
 duckdb: ## Query the Iceberg table with DuckDB (view: events)
 	@command -v duckdb >/dev/null || { echo "duckdb not found. Install it: brew install duckdb"; exit 1; }
-	duckdb -cmd "INSTALL httpfs; INSTALL iceberg; LOAD iceberg; \
+	duckdb -cmd "INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg; \
 		CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION '$(REGION)'); \
-		CREATE OR REPLACE VIEW events AS \
-		SELECT * FROM iceberg_scan('$$($(MAKE) -s table-location)', allow_moved_paths = true);"
+		ATTACH '$$(aws sts get-caller-identity --query Account --output text)' \
+			AS lake (TYPE iceberg, ENDPOINT_TYPE glue); \
+		CREATE OR REPLACE VIEW events AS SELECT * FROM lake.$(GLUE_DATABASE).$(GLUE_TABLE);"
 
 invoke-local: ## Invoke the webhook locally with events/post.json (needs env.json, see README)
 	sam local invoke WebhookFunction -e events/post.json --env-vars env.json
