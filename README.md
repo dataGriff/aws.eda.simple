@@ -1,1 +1,165 @@
 # aws.eda.simple
+
+A small, complete event-driven architecture on AWS:
+
+1. A **fake data generator** (local Python script) POSTs synthetic shop events to a webhook.
+2. The webhook is a **Lambda function exposed through a Function URL**, protected by a shared-secret header.
+3. The Lambda validates the events and publishes them to a **custom Amazon EventBridge bus** with `PutEvents`.
+4. A **catch-all rule** on the bus copies every event to a **CloudWatch log group**, so you can watch the pipeline work end-to-end without writing a consumer.
+
+```mermaid
+flowchart LR
+    G[generator/generate.py<br/>fake data generator] -- "POST JSON<br/>X-Webhook-Secret" --> U[Lambda Function URL]
+    U --> L[WebhookFunction<br/>validate + batch]
+    L -- "PutEvents (≤10 per call)" --> B[(EventBridge bus<br/>simple-eda-bus)]
+    B -- "CatchAllRule<br/>source = com.example.shop" --> C[CloudWatch Logs<br/>/aws/events/simple-eda-bus]
+```
+
+Everything is deployed with **AWS SAM** from a single `template.yaml`. The Lambda has **no third-party dependencies** (boto3 ships with the runtime).
+
+## Project layout
+
+```
+template.yaml               SAM template: bus, Lambda + Function URL, IAM, rule, log groups
+samconfig.toml              SAM CLI defaults (stack name, region, non-secret parameters)
+Makefile                    install / lint / test / build / deploy / generate / logs / delete
+src/webhook/app.py          Lambda handler and pure helper functions
+generator/generate.py       Fake data generator CLI (runs locally, not deployed)
+tests/                      pytest unit tests (botocore Stubber, no AWS account needed)
+events/post.json            Sample Function URL event for `sam local invoke`
+env.example.json            Template for local env vars (copy to env.json, git-ignored)
+.github/workflows/ci.yml    Lint + tests + `sam validate --lint`
+```
+
+## Event contract
+
+The webhook accepts `POST` with `Content-Type: application/json` and the header `X-Webhook-Secret: <secret>`.
+The body is **either one event object or a JSON array of them** (up to 100 per request).
+
+```json
+{
+  "id": "evt_4f9c2a1b6e0d",
+  "type": "order.created",
+  "timestamp": "2026-09-26T14:47:03Z",
+  "data": { "order_id": "ord_1a2b3c", "customer_name": "Ada Lovelace", "total": 19.98, "currency": "GBP", "...": "..." }
+}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | non-empty string, max 128 chars |
+| `type` | one of `order.created`, `order.updated`, `payment.received` |
+| `timestamp` | ISO-8601 with a timezone (`Z` or offset) |
+| `data` | JSON object (contents are passed through untouched) |
+
+Each event becomes one EventBridge entry: `source` is fixed per deployment (`EventSource` parameter, never taken from the payload), `detail-type` is the event `type`, `detail` is the whole inbound object, and `time` is the event `timestamp`.
+
+| Response | Meaning |
+|---|---|
+| `202` | Events validated and sent. Body: `{"accepted": n, "failed": m, "failures": [...]}` (partial EventBridge failures are reported here, not hidden) |
+| `400` | Invalid JSON, wrong shape, empty array, too many events, or any event failing validation. Nothing is sent. Body lists every problem. |
+| `401` | Missing or wrong `X-Webhook-Secret` |
+| `405` | Any method other than `POST` |
+| `500` | EventBridge call raised an error (details in the Lambda logs) |
+
+## Prerequisites
+
+- An AWS account and credentials configured for the AWS CLI
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
+- Python 3.12 (3.11 also works for local tests) and `make`
+
+## Setup
+
+```bash
+make install            # creates .venv and installs dev dependencies
+source .venv/bin/activate
+make lint test          # ruff + 60-odd unit tests, no AWS needed
+```
+
+## Deploy
+
+```bash
+export WEBHOOK_SECRET=$(openssl rand -hex 24)   # keep this, the generator needs it
+make deploy                                     # sam build + sam deploy
+make outputs                                    # shows WebhookUrl, bus name, log group
+```
+
+`make deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with make variables, e.g. `make deploy REGION=us-east-1 BUS_NAME=my-bus`.
+For a first-time interactive deploy you can also use `make deploy-guided`.
+
+## Run the fake data generator
+
+```bash
+make generate           # 10 POSTs, 3 events each, every 2 seconds, using the deployed URL
+```
+
+or call the script directly:
+
+```bash
+python generator/generate.py --url "$(make -s url)" --secret "$WEBHOOK_SECRET" \
+    --batch-size 5 --interval 1 --count 20
+python generator/generate.py --help
+python generator/generate.py --url x --secret x --dry-run --count 1   # print a payload only
+```
+
+Options: `--interval` seconds between POSTs, `--count` (0 = until Ctrl-C), `--batch-size` (1 sends a bare object, more sends an array), `--types` to restrict event types, `--seed` for reproducible data. `--url` / `--secret` fall back to `WEBHOOK_URL` / `WEBHOOK_SECRET`.
+
+Example output:
+
+```
+[15:02:11] POST 3 event(s) -> 202 accepted=3 failed=0
+[15:02:13] POST 3 event(s) -> 202 accepted=3 failed=0
+done: 2 request(s), 6 event(s) accepted, 0 request(s) failed
+```
+
+## Verify the events arrived
+
+```bash
+make logs-events        # tails /aws/events/simple-eda-bus: one line per event on the bus
+make logs               # tails the Lambda's own logs (accepted/failed counts per request)
+```
+
+A delivered event looks like this in the events log group:
+
+```json
+{"version":"0","id":"...","detail-type":"order.created","source":"com.example.shop",
+ "time":"2026-09-26T14:47:03Z","detail":{"id":"evt_...","type":"order.created","timestamp":"...","data":{...}}}
+```
+
+Quick manual checks with curl:
+
+```bash
+URL=$(make -s url)
+curl -si "$URL"                                                            # 405
+curl -si -X POST "$URL" -d '{}'                                            # 401 (no secret)
+curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" -d 'nope'   # 400
+curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+     -H 'Content-Type: application/json' \
+     -d '{"id":"evt_1","type":"order.created","timestamp":"2026-09-26T14:47:03Z","data":{"order_id":"ord_1"}}'  # 202
+```
+
+## Local development
+
+- `make lint`, `make fmt`, `make test`, `make validate` (`sam validate --lint`).
+- `make invoke-local` runs the handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. Note that the handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
+- `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
+
+## Security notes
+
+- The Function URL is public; the shared secret header is the only gate. Comparison is constant-time and the secret is never logged. Rotate it by redeploying with a new `WEBHOOK_SECRET`.
+- The secret is stored as a Lambda environment variable (`NoEcho` in CloudFormation). For production, move it to SSM Parameter Store or Secrets Manager, or switch the Function URL to `AuthType: AWS_IAM`.
+- The function's IAM role can only call `events:PutEvents` on this one bus.
+- If you need WAF, throttling or custom domains, put an API Gateway HTTP API in front of the function instead of a Function URL.
+
+## Tear down
+
+```bash
+make delete             # sam delete, removes the stack including log groups and the resource policy
+```
+
+## How it works (implementation notes)
+
+- `src/webhook/app.py` is split into small pure functions (`is_authorized`, `parse_body`, `validate_event`, `to_entry`, `chunk`, `put_events`) so the whole request path is unit-tested with botocore's `Stubber`, including EventBridge partial failures.
+- `PutEvents` accepts at most 10 entries per call, so requests are chunked; failures are reported with their index in the original request.
+- The CloudWatch Logs target needs an `AWS::Logs::ResourcePolicy` allowing `events.amazonaws.com` to write to the log group. Without it the rule deploys but silently delivers nothing.
+- `tests/test_generator.py` feeds the generator's output through the Lambda's own `validate_event`, so the two sides of the contract cannot drift apart.
