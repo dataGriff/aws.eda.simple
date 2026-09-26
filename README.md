@@ -36,6 +36,8 @@ generator/generate.py         Fake data generator CLI (runs locally, not deploye
 tests/                        pytest unit tests (botocore Stubber, no AWS account needed)
 events/post.json              Sample Function URL event for `sam local invoke`
 events/firehose.json          Sample Firehose records event for `sam local invoke`
+queries/views.sql             DuckDB views over the table (orders, order_items, payments)
+queries/examples.sql          Example analytical queries, runnable with `make query`
 env.example.json              Template for local env vars (copy to env.json, git-ignored)
 .github/workflows/ci.yml      Lint + tests + `sam validate --lint`
 ```
@@ -160,7 +162,58 @@ make duckdb             # opens the DuckDB prompt with an `events` view over the
 ```
 
 `make duckdb` leaves you at DuckDB's interactive prompt (`memory D`), with the Glue catalog attached and
-an `events` view ready. Type SQL, and `.quit` to leave.
+the views from `queries/views.sql` loaded. Type SQL, and `.quit` to leave. `make query` runs a file
+instead and prints the results:
+
+```bash
+make query                                  # runs queries/examples.sql
+make query QUERY_FILE=queries/views.sql     # or any other file
+```
+
+### Digging into the payload
+
+`detail` is a JSON string, so payload fields are extracted at query time. `queries/views.sql` does that
+once and gives you three views to build on:
+
+| View | One row per | Notes |
+|---|---|---|
+| `events` | event | the table itself, created by the Makefile |
+| `orders` | `order.created` event | header fields plus the payload's own `total` |
+| `order_items` | **line item** | the `items` array unnested |
+| `payments` | `payment.received` event | the same extraction pattern without an array |
+
+Arrays are the only fiddly part. `order.created` carries an `items` array, so it needs unnesting — cast it
+to a typed struct once and there is no per-field casting afterwards:
+
+```sql
+SELECT e.event_id,
+       i.sku, i.qty, i.unit_price
+FROM   events e,
+       unnest(from_json(json_extract(e.detail, '$.data.items'),
+                        '["STRUCT(sku VARCHAR, qty INTEGER, unit_price DOUBLE)"]')) AS t(i)
+WHERE  e.event_type = 'order.created';
+```
+
+The comma before `unnest()` is a lateral join: one output row per array element, with the parent event's
+columns repeated. For quick ad-hoc work you can skip the struct schema and use the arrow operators — `->`
+returns JSON, `->>` returns text:
+
+```sql
+SELECT item ->> '$.sku' AS sku, CAST(item ->> '$.qty' AS INTEGER) AS qty
+FROM   events, unnest(from_json(detail -> '$.data.items', '["JSON"]')) AS t(item)
+WHERE  event_type = 'order.created';
+```
+
+Only `order.created` has `items`, which is why these filter on `event_type` — without it the other two
+types contribute no rows but are still scanned.
+
+This query-time extraction is the price of keeping `detail` raw, and it is the right default: the landing
+table cannot break when a payload changes. If item-level analytics becomes routine, promote `items` to a
+real Iceberg `list<struct<…>>` column in the transform, or derive a second table from `events` and leave
+the raw one as the unbreakable landing zone.
+
+In Athena or Trino the unnest syntax differs:
+`CROSS JOIN UNNEST(CAST(json_extract(detail, '$.data.items') AS ARRAY(ROW(sku VARCHAR, qty INTEGER, unit_price DOUBLE)))) AS t(i)`.
 
 ```sql
 SELECT count(*) FROM events;

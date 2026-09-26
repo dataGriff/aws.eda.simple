@@ -8,10 +8,16 @@ GLUE_TABLE   ?= events
 # Extra duckdb CLI flags, e.g. DUCKDB_FLAGS=-dark-mode if your terminal does not
 # answer DuckDB's background-colour probe.
 DUCKDB_FLAGS ?=
+# Shared by `duckdb` and `query` so the two cannot drift apart. ATTACH needs the
+# account id, which the recipes resolve at run time.
+DUCKDB_BOOT = INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg; \
+	CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain, REGION '$(REGION)');
+DUCKDB_VIEW = CREATE OR REPLACE VIEW events AS SELECT * FROM lake.$(GLUE_DATABASE).$(GLUE_TABLE);
+QUERY_FILE ?= queries/examples.sql
 # Required for `make deploy`. Generate one with: export WEBHOOK_SECRET=$$(openssl rand -hex 24)
 WEBHOOK_SECRET ?=
 
-.PHONY: help install lint fmt test validate build deploy deploy-guided outputs url bucket table-location generate logs logs-events logs-firehose errors duckdb invoke-local invoke-local-transform empty-bucket delete
+.PHONY: help install lint fmt test validate build deploy deploy-guided outputs url bucket table-location generate logs logs-events logs-firehose errors duckdb query invoke-local invoke-local-transform empty-bucket delete
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -87,17 +93,25 @@ errors: ## List records Firehose could not deliver (should report none)
 	@aws s3 ls "s3://$$($(MAKE) -s bucket)/errors/" --recursive --region $(REGION) \
 		|| echo "no delivery errors"
 
-duckdb: ## Query the Iceberg table with DuckDB (view: events)
+duckdb: ## Open the DuckDB prompt with the table and queries/views.sql loaded
 	@command -v duckdb >/dev/null || { echo "duckdb not found. Install it: brew install duckdb"; exit 1; }
 	@ACCOUNT=$$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
 		&& test -n "$$ACCOUNT" \
 		|| { echo "no AWS credentials in this shell - log in first, then retry"; exit 1; }; \
-	echo "Attaching $(GLUE_DATABASE).$(GLUE_TABLE)... then you are at the DuckDB prompt."; \
-	echo "Try: SELECT count(*) FROM events;   Leave with: .quit"; \
-	duckdb $(DUCKDB_FLAGS) -cmd "INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg; \
-		CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain, REGION '$(REGION)'); \
-		ATTACH '$$ACCOUNT' AS lake (TYPE iceberg, ENDPOINT_TYPE glue); \
-		CREATE OR REPLACE VIEW events AS SELECT * FROM lake.$(GLUE_DATABASE).$(GLUE_TABLE);"
+	echo "Views: events, orders, order_items, payments. Leave with: .quit"; \
+	echo "Try: SELECT sku, sum(qty) FROM order_items GROUP BY 1 ORDER BY 2 DESC LIMIT 5;"; \
+	duckdb $(DUCKDB_FLAGS) \
+		-cmd "$(DUCKDB_BOOT) ATTACH '$$ACCOUNT' AS lake (TYPE iceberg, ENDPOINT_TYPE glue); $(DUCKDB_VIEW)" \
+		-cmd ".read queries/views.sql"
+
+query: ## Run a SQL file non-interactively (default QUERY_FILE=queries/examples.sql)
+	@ACCOUNT=$$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+		&& test -n "$$ACCOUNT" \
+		|| { echo "no AWS credentials in this shell - log in first, then retry"; exit 1; }; \
+	duckdb $(DUCKDB_FLAGS) -box \
+		-cmd "$(DUCKDB_BOOT) ATTACH '$$ACCOUNT' AS lake (TYPE iceberg, ENDPOINT_TYPE glue); $(DUCKDB_VIEW)" \
+		-cmd ".read queries/views.sql" \
+		-c ".read $(QUERY_FILE)"
 
 invoke-local: ## Invoke the webhook locally with events/post.json (needs env.json, see README)
 	sam local invoke WebhookFunction -e events/post.json --env-vars env.json
