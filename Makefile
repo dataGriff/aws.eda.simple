@@ -5,6 +5,9 @@ BUS_NAME    ?= simple-eda-bus
 EVENT_SOURCE ?= com.example.shop
 GLUE_DATABASE ?= shop_events
 GLUE_TABLE   ?= events
+# Extra duckdb CLI flags, e.g. DUCKDB_FLAGS=-dark-mode if your terminal does not
+# answer DuckDB's background-colour probe.
+DUCKDB_FLAGS ?=
 # Required for `make deploy`. Generate one with: export WEBHOOK_SECRET=$$(openssl rand -hex 24)
 WEBHOOK_SECRET ?=
 
@@ -86,10 +89,14 @@ errors: ## List records Firehose could not deliver (should report none)
 
 duckdb: ## Query the Iceberg table with DuckDB (view: events)
 	@command -v duckdb >/dev/null || { echo "duckdb not found. Install it: brew install duckdb"; exit 1; }
-	duckdb -cmd "INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg; \
-		CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION '$(REGION)'); \
-		ATTACH '$$(aws sts get-caller-identity --query Account --output text)' \
-			AS lake (TYPE iceberg, ENDPOINT_TYPE glue); \
+	@ACCOUNT=$$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+		&& test -n "$$ACCOUNT" \
+		|| { echo "no AWS credentials in this shell - log in first, then retry"; exit 1; }; \
+	echo "Attaching $(GLUE_DATABASE).$(GLUE_TABLE)... then you are at the DuckDB prompt."; \
+	echo "Try: SELECT count(*) FROM events;   Leave with: .quit"; \
+	duckdb $(DUCKDB_FLAGS) -cmd "INSTALL aws; INSTALL httpfs; INSTALL iceberg; LOAD aws; LOAD iceberg; \
+		CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain, REGION '$(REGION)'); \
+		ATTACH '$$ACCOUNT' AS lake (TYPE iceberg, ENDPOINT_TYPE glue); \
 		CREATE OR REPLACE VIEW events AS SELECT * FROM lake.$(GLUE_DATABASE).$(GLUE_TABLE);"
 
 invoke-local: ## Invoke the webhook locally with events/post.json (needs env.json, see README)

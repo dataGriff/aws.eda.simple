@@ -155,9 +155,12 @@ curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
 Firehose buffers for 60 seconds, so give it a minute after `make generate`, then:
 
 ```bash
-make errors             # should print nothing: anything here failed to deliver
-make duckdb             # opens DuckDB with an `events` view over the table
+make errors             # should report none: anything here failed to deliver
+make duckdb             # opens the DuckDB prompt with an `events` view over the table
 ```
+
+`make duckdb` leaves you at DuckDB's interactive prompt (`memory D`), with the Glue catalog attached and
+an `events` view ready. Type SQL, and `.quit` to leave.
 
 ```sql
 SELECT count(*) FROM events;
