@@ -1,0 +1,12 @@
+{
+  "invocationId": "b1f2c3d4-0000-1111-2222-333344445555",
+  "deliveryStreamArn": "arn:aws:firehose:eu-west-1:123456789012:deliverystream/aws-eda-simple-events-to-iceberg",
+  "region": "eu-west-1",
+  "records": [
+    {
+      "recordId": "49590000000000000000000000000000000000000000000000000000",
+      "approximateArrivalTimestamp": 1790000000000,
+      "data": "eyJ2ZXJzaW9uIjogIjAiLCAiaWQiOiAiZTFmMmEzYjQtMDAwMC0xMTExLTIyMjItMzMzMzQ0NDQ1NTU1IiwgImRldGFpbC10eXBlIjogIm9yZGVyLmNyZWF0ZWQiLCAic291cmNlIjogImNvbS5leGFtcGxlLnNob3AiLCAiYWNjb3VudCI6ICIxMjM0NTY3ODkwMTIiLCAidGltZSI6ICIyMDI2LTA5LTI2VDE0OjQ3OjAzWiIsICJyZWdpb24iOiAiZXUtd2VzdC0xIiwgInJlc291cmNlcyI6IFtdLCAiZGV0YWlsIjogeyJpZCI6ICJldnRfNGY5YzJhMWI2ZTBkIiwgInR5cGUiOiAib3JkZXIuY3JlYXRlZCIsICJ0aW1lc3RhbXAiOiAiMjAyNi0wOS0yNlQxNDo0NzowM1oiLCAiZGF0YSI6IHsib3JkZXJfaWQiOiAib3JkXzFhMmIzYzRkNWU2ZiIsICJjdXN0b21lcl9uYW1lIjogIkFkYSBMb3ZlbGFjZSIsICJjdXN0b21lcl9lbWFpbCI6ICJhZGFAZXhhbXBsZS5jb20iLCAiaXRlbXMiOiBbeyJza3UiOiAiU0tVLUFCQ0QtMTIzNCIsICJxdHkiOiAyLCAidW5pdF9wcmljZSI6IDkuOTl9XSwgInRvdGFsIjogMTkuOTgsICJjdXJyZW5jeSI6ICJHQlAifX19"
+    }
+  ]
+}
