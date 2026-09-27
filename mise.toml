@@ -1,0 +1,9 @@
+# Every tool this repo needs, pinned here so developers, AI agents and CI use the same
+# versions: `mise install` once, then everything goes through `task`.
+[tools]
+python = "3.12"
+task = "latest"
+duckdb = "latest"
+awscli = "latest"
+aws-sam-cli = "latest"
+"pypi:aws-sam-cli-local" = "latest"   # samlocal: points SAM at LocalStack

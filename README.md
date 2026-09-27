@@ -29,17 +29,18 @@ Everything is deployed with **AWS SAM** from a single `template.yaml`, with no p
 ```
 template.yaml               SAM template: bus, Lambdas, IAM, rule, log groups, bucket, queues
 samconfig.toml              SAM CLI defaults; [local] env targets LocalStack
-Makefile                    install / lint / test / build / deploy / generate / logs / duckdb / local-* / delete
+mise.toml                   Every tool, pinned: python, task, duckdb, awscli, sam, samlocal
+Taskfile.yml                Every command: `task --list`. CI calls the same tasks you do
 src/webhook/app.py          Webhook handler and pure helper functions
 src/archiver/app.py         Archiver: SQS batch of bus envelopes -> one gzipped JSON Lines file on S3
 generator/generate.py       Fake data generator CLI (runs locally, not deployed)
 queries/views.sql           DuckDB views over the archive (events, orders, order_items, payments)
-queries/examples.sql        Example analytical queries, runnable with `make query`
+queries/examples.sql        Example analytical queries, runnable with `task query`
 tests/                      pytest unit tests (botocore Stubber + DuckDB, no AWS account needed)
 events/post.json            Sample Function URL event for `sam local invoke`
 events/sqs.json             Sample SQS batch for `sam local invoke`
 env.example.json            Template for local env vars (copy to env.json, git-ignored)
-.github/workflows/ci.yml    Lint + tests + `sam validate --lint`, then the whole pipeline in LocalStack
+.github/workflows/ci.yml    `task ci`, then `task local:e2e` - nothing that only exists in CI
 ```
 
 ## Event contract
@@ -75,21 +76,22 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 
 ## Prerequisites
 
-- Python 3.12 (3.11 also works for local tests) and `make`
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- To query the archive: the [DuckDB CLI](https://duckdb.org/docs/installation/) (`brew install duckdb`)
-- To deploy to AWS: an AWS account and credentials configured for the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-- To run it locally instead: Docker, `pip install aws-sam-cli-local` (`samlocal`, which points SAM at LocalStack), and a free [LocalStack](https://app.localstack.cloud) auth token
+- [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, the AWS CLI, SAM and `samlocal`
+- To deploy to AWS: an AWS account and credentials configured for the AWS CLI
+- To run it locally instead: Docker and a free [LocalStack](https://app.localstack.cloud) auth token
 
-No account-level setup is needed for AWS. `make deploy` is the whole story.
+No account-level setup is needed for AWS. `task deploy` is the whole story.
 
 ## Setup
 
 ```bash
-make install            # creates .venv and installs dev dependencies
-source .venv/bin/activate
-make lint test          # ruff + 80-odd unit tests, no AWS needed
+mise install            # tools from mise.toml
+task install            # creates .venv and installs dev dependencies
+task ci                 # ruff + 80-odd unit tests + sam validate, no AWS needed
+task --list             # everything else
 ```
+
+Every command below is a `task`; CI runs the very same tasks, so if it works for you it works there.
 
 ## Run the whole thing locally
 
@@ -97,48 +99,55 @@ The pipeline runs unchanged in [LocalStack](https://localstack.cloud): same temp
 generator, same DuckDB queries. No AWS account, no secret to generate.
 
 ```bash
-make local-up           # docker run localstack/localstack, waits for healthy
-make local-deploy       # samlocal build + deploy (samconfig.toml [local] env)
-make local-generate     # 10 POSTs, 3 events each, at the local Function URL
-sleep 45                # the archiver batches for up to 30s
-make local-verify       # DuckDB counts the archived events: expects 30
-make local-query        # runs queries/examples.sql over the local archive
-make local-duckdb       # or poke at it interactively
-make local-down
+export LOCALSTACK_AUTH_TOKEN=...   # free tier is fine; see below
+task local:e2e          # up, deploy, generate, wait, verify - then tears LocalStack down
 ```
 
-`make local-generate` posts to `localhost:4566` with the Function URL's hostname in the `Host` header, which is
+or step by step, leaving LocalStack up to poke at:
+
+```bash
+task local:up           # docker run localstack/localstack, waits for healthy
+task local:deploy       # samlocal build + deploy (samconfig.toml [local] env)
+task local:generate     # 10 POSTs, 3 events each, at the local Function URL
+sleep 45                # the archiver batches for up to 30s
+task local:verify       # DuckDB counts the archived events: expects 30
+task local:query        # runs queries/examples.sql over the local archive
+task local:duckdb       # or interactively
+task local:down
+```
+
+`task local:generate` posts to `localhost:4566` with the Function URL's hostname in the `Host` header, which is
 how LocalStack routes Function URLs anyway - so it works even where your resolver refuses the
 `*.localhost.localstack.cloud` wildcard (some ISPs block DNS answers that point at 127.0.0.1).
 
-`make local-up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
+`task local:up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
 free Hobby tier** (the image exits with "License activation failed" without one), so create an account at
 [app.localstack.cloud](https://app.localstack.cloud) and `export LOCALSTACK_AUTH_TOKEN=...` first. The token lives in
 your shell (or a CI secret), never in the repo. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64`
-functions run on an x86 host. CI runs exactly this sequence on every push, with the token as the
-`LOCALSTACK_AUTH_TOKEN` repository secret - see `.github/workflows/ci.yml`.
+functions run on an x86 host. CI runs `task local:e2e` on every push, with the token as the `LOCALSTACK_AUTH_TOKEN` repository
+secret - see `.github/workflows/ci.yml`.
 
 ## Deploy to AWS
 
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -hex 24)   # keep this, the generator needs it
-make deploy                                     # sam build + sam deploy
-make outputs                                    # shows WebhookUrl, bucket, queue URLs
+task deploy                                     # sam build + sam deploy
+task outputs                                    # shows WebhookUrl, bucket, queue URLs
 ```
 
-`make deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with make variables, e.g. `make deploy REGION=us-east-1 BUS_NAME=my-bus`.
-For a first-time interactive deploy you can also use `make deploy-guided`.
+`task deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with task variables, e.g. `task deploy REGION=us-east-1 BUS_NAME=my-bus`.
+For a first-time interactive deploy you can also use `task deploy:guided`.
 
 ## Run the fake data generator
 
 ```bash
-make generate           # 10 POSTs, 3 events each, every 2 seconds, using the deployed URL
+task generate           # 10 POSTs, 3 events each, every 2 seconds, using the deployed URL
 ```
 
 or call the script directly:
 
 ```bash
-python generator/generate.py --url "$(make -s url)" --secret "$WEBHOOK_SECRET" \
+python generator/generate.py --url "$(task url)" --secret "$WEBHOOK_SECRET" \
     --batch-size 5 --interval 1 --count 20
 python generator/generate.py --help
 python generator/generate.py --url x --secret x --dry-run --count 1   # print a payload only
@@ -157,10 +166,10 @@ done: 2 request(s), 6 event(s) accepted, 0 request(s) failed
 ## Watch the events flow
 
 ```bash
-make logs-events        # tails /aws/events/simple-eda-bus: one line per event on the bus
-make logs               # tails the webhook's own logs (accepted/failed counts per request)
-make logs-archiver      # tails the archiver: one line per batch written, with the S3 key
-make errors             # dead-letter queue depth - "no delivery errors" is what you want
+task logs:events        # tails /aws/events/simple-eda-bus: one line per event on the bus
+task logs               # tails the webhook's own logs (accepted/failed counts per request)
+task logs:archiver      # tails the archiver: one line per batch written, with the S3 key
+task errors             # dead-letter queue depth - "no delivery errors" is what you want
 ```
 
 A delivered event looks like this in the events log group, and identically in the archive:
@@ -173,7 +182,7 @@ A delivered event looks like this in the events log group, and identically in th
 Quick manual checks with curl:
 
 ```bash
-URL=$(make -s url)
+URL=$(task url)
 curl -si "$URL"                                                            # 405
 curl -si -X POST "$URL" -d '{}'                                            # 401 (no secret)
 curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" -d 'nope'   # 400
@@ -184,13 +193,13 @@ curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
 
 ## Query the archive
 
-The archiver batches for up to 30 seconds, so give it a minute after `make generate`, then:
+The archiver batches for up to 30 seconds, so give it a minute after `task generate`, then:
 
 ```bash
-make errors             # should report none
-make duckdb             # opens the DuckDB prompt with the views from queries/views.sql loaded
-make query              # runs queries/examples.sql and prints the results
-make query QUERY_FILE=queries/views.sql     # or any other file
+task errors             # should report none
+task duckdb             # opens the DuckDB prompt with the views from queries/views.sql loaded
+task query              # runs queries/examples.sql and prints the results
+task query QUERY_FILE=queries/views.sql     # or any other file
 ```
 
 ```sql
@@ -212,7 +221,7 @@ timestamp in the name is when the batch was written.
 ### How DuckDB reads it
 
 `queries/views.sql` reads the archive location from a DuckDB variable, so the same file serves S3, LocalStack
-and the test suite's temp directory. `make duckdb` does this for you:
+and the test suite's temp directory. `task duckdb` does this for you:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -272,11 +281,11 @@ alone. In Athena or Trino the unnest above becomes
 
 ## Local development
 
-- `make lint`, `make fmt`, `make test`, `make validate` (`sam validate --lint`).
+- `task lint`, `task fmt`, `task test`, `task validate` (`sam validate --lint`), or all three checks with `task ci`.
 - `tests/test_archive_query.py` writes archive files with the archiver's own code and queries them through
   `queries/views.sql` with the DuckDB Python package - so the SQL is tested offline, against the real file format.
-- `make invoke-local` runs the webhook handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. The handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
-- `make invoke-local-archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. For a fully local run use the LocalStack targets above instead.
+- `task invoke:webhook` runs the webhook handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. The handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
+- `task invoke:archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. For a fully local run use the LocalStack targets above instead.
 - `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
 
 ## Security notes
@@ -290,12 +299,12 @@ alone. In Athena or Trino the unnest above becomes
 ## Tear down
 
 ```bash
-make empty-bucket       # required: CloudFormation cannot delete a bucket that still has objects
-make delete             # sam delete, removes the stack including log groups and the queue policy
+task empty-bucket       # required: CloudFormation cannot delete a bucket that still has objects
+task delete             # sam delete, removes the stack including log groups and the queue policy
 ```
 
-`make empty-bucket` deletes the archive, so it is deliberately a separate step rather than chained into
-`make delete`. Nothing is left behind in the account afterwards.
+`task empty-bucket` deletes the archive, so it is deliberately a separate step rather than chained into
+`task delete`. Nothing is left behind in the account afterwards.
 
 ## How it works (implementation notes)
 
