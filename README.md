@@ -36,6 +36,7 @@ src/archiver/app.py         Archiver: SQS batch of bus envelopes -> one gzipped 
 generator/generate.py       Fake data generator CLI (runs locally, not deployed)
 queries/views.sql           DuckDB views over the archive (events, orders, order_items, payments)
 queries/examples.sql        Example analytical queries, runnable with `task query`
+guide.md                    Build this yourself: the solution as nine ordered tasks, with the gotchas
 tests/                      pytest unit tests (botocore Stubber + DuckDB, no AWS account needed)
 events/post.json            Sample Function URL event for `sam local invoke`
 events/sqs.json             Sample SQS batch for `sam local invoke`
