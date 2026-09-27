@@ -109,10 +109,13 @@ the object key layout, `queries/views.sql` and every test on the read side. Duck
   treats the missing field as zero; moto rejects it, so the test queues use a 3-second visibility timeout and
   wait for expiry instead. If Floci behaves like moto, a rejected message is dead-lettered after three visibility
   timeouts (about 5 minutes) rather than at once. Nothing is lost either way.
-- **Not verified on this branch:** an AWS deploy (no account in the session that built it) and the Floci run
-  (no Docker in that session). CI runs the Floci job on every push; the AWS-only resources - VPC, ECS service,
-  roles, health check - pass `cfn-lint` and `sam validate` and follow the standard Fargate pattern, but have not
-  been seen running.
+- **Verified and not.** The Floci job in CI passed on the first run after a Taskfile typo: the stack deployed
+  with `ArchiverDeployment=none`, the container built for `amd64` and was ready one second after `docker run`,
+  30 events were posted and DuckDB counted 30 in the archive, with no emulator-specific configuration beyond
+  the three environment variables. Floci's CloudFormation skipped the conditional resources correctly and only
+  left the conditional *outputs* unresolved (cosmetic). Not verified: an AWS deploy - no account in the session
+  that built this branch. The AWS-only resources - VPC, ECS service, roles, health check - pass `cfn-lint` and
+  `sam validate` and follow the standard Fargate pattern, but have not been seen running.
 
 ## Multiple event schemas
 
