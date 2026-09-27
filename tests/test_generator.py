@@ -113,6 +113,24 @@ def test_post_overrides_host_header_when_asked(monkeypatch):
     assert seen["host"] is None
 
 
+def test_post_treats_timeout_like_a_connection_error(monkeypatch, capsys):
+    def slow_urlopen(req, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(generate.urllib.request, "urlopen", slow_urlopen)
+    monkeypatch.setenv("WEBHOOK_URL", "http://localhost:4566/")
+    monkeypatch.setenv("WEBHOOK_SECRET", "s")
+    rc = generate.main(["--count", "1", "--interval", "0", "--timeout", "0.1"])
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "connection error: timed out" in out
+
+
+def test_parse_args_accepts_timeout():
+    assert generate.parse_args(["--url", "u", "--secret", "s", "--timeout", "60"]).timeout == 60.0
+    assert generate.parse_args(["--url", "u", "--secret", "s"]).timeout == 10.0
+
+
 def test_parse_args_accepts_host(monkeypatch):
     monkeypatch.delenv("WEBHOOK_HOST", raising=False)
     args = generate.parse_args(["--url", "u", "--secret", "s", "--host", "h.example"])

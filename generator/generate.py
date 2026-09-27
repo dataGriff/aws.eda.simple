@@ -180,6 +180,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=os.environ.get("WEBHOOK_HOST"),
         help="Override the Host header (env WEBHOOK_HOST); for LocalStack Function URLs",
     )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for each response (default 10; raise it for emulator cold starts)",
+    )
     p.add_argument("--interval", type=float, default=2.0, help="Seconds between POSTs (default 2)")
     p.add_argument("--count", type=int, default=0, help="Number of POSTs; 0 = run until Ctrl-C")
     p.add_argument("--batch-size", type=int, default=1, help="Events per POST (1 = single object)")
@@ -221,10 +227,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(payload, indent=2))
             else:
                 try:
-                    status, body = post(args.url, args.secret, payload, host=args.host)
-                except urllib.error.URLError as exc:
+                    status, body = post(
+                        args.url, args.secret, payload, timeout=args.timeout, host=args.host
+                    )
+                except (urllib.error.URLError, TimeoutError) as exc:
                     failed += 1
-                    print(f"[{stamp}] POST {n} event(s) -> connection error: {exc.reason}")
+                    reason = getattr(exc, "reason", None) or exc
+                    print(f"[{stamp}] POST {n} event(s) -> connection error: {reason}")
                 else:
                     ok = 200 <= status < 300
                     sent += n if ok else 0

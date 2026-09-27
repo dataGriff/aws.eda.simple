@@ -235,6 +235,9 @@ tasks:
           sleep 2
         done
         echo "Floci did not come up in time"; docker logs floci-main | tail -20; exit 1
+      # Pull the Lambda runtime image now rather than inside the first invocation: on a fresh
+      # machine or CI runner that pull is ~780 MB and would otherwise eat the first request.
+      - docker pull -q public.ecr.aws/lambda/python:3.12
 
   local:down:
     desc: Stop and remove Floci (deletes everything in it)
@@ -274,7 +277,7 @@ tasks:
       - echo "POSTing to {{.LOCAL_ENDPOINT}}/ as {{.HOST}}"
       - >-
         WEBHOOK_URL={{.LOCAL_ENDPOINT}}/ WEBHOOK_HOST={{.HOST}} WEBHOOK_SECRET={{.LOCAL_SECRET}}
-        {{.PY}} generator/generate.py --interval 1 --batch-size 3 --count 10
+        {{.PY}} generator/generate.py --interval 1 --batch-size 3 --count 10 --timeout 60
 
   # --- look inside Floci: the same helpers, pointed at the local endpoint
   local:health:
