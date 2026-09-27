@@ -1,6 +1,8 @@
-"""Read-side tests: the archiver's own files, queried through queries/views.sql with DuckDB.
+"""Read-side tests: files in the archiver's format, queried through queries/views.sql with DuckDB.
 
-No AWS. The same views.sql runs against S3, LocalStack and this tmp_path.
+No AWS. The same views.sql runs against S3, Floci and this tmp_path. The archiver itself is
+a Bento config (src/archiver/archiver.yaml) tested by `bento test`; tests.helpers.pack
+writes the same bytes so the SQL is exercised against the real file format.
 """
 
 import json
@@ -10,9 +12,8 @@ import duckdb
 import pytest
 from faker import Faker
 
-from archiver import app as archiver
 from generator import generate
-from tests.helpers import bus_envelope, bus_envelope_from_entry, sample_event
+from tests.helpers import bus_envelope, bus_envelope_from_entry, pack, sample_event
 from webhook import app as webhook
 
 VIEWS = Path(__file__).resolve().parents[1] / "queries" / "views.sql"
@@ -22,7 +23,7 @@ def write_archive(root: Path, day: str, stamp: str, batch: str, envelopes) -> Pa
     path = root / "events" / f"dt={day}" / f"{stamp}Z-{batch}.jsonl.gz"
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps(e, separators=(",", ":")) for e in envelopes]
-    path.write_bytes(archiver.pack(lines))
+    path.write_bytes(pack(lines))
     return path
 
 
@@ -146,11 +147,10 @@ def test_generator_through_webhook_and_archiver_to_the_view(con, kind):
     entry = webhook.to_entry(evt, source="com.example.shop", bus_name="test-bus")
     envelope = bus_envelope_from_entry(entry)
 
-    lines, failed = archiver.parse_messages([{"messageId": "m", "body": json.dumps(envelope)}])
-    assert failed == []
+    # The archiver keeps the SQS body verbatim: one envelope per line, as delivered.
     path = root / "events" / "dt=2026-09-27" / "2026-09-27T10-00-30Z-aaa.jsonl.gz"
     path.parent.mkdir(parents=True)
-    path.write_bytes(archiver.pack(lines))
+    path.write_bytes(pack([json.dumps(envelope, separators=(",", ":"))]))
     load_views(con)
 
     row = con.execute("SELECT event_id, event_type, detail FROM events").fetchone()

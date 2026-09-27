@@ -1,6 +1,7 @@
 """Test helpers shared across modules (no AWS, no side effects on import)."""
 
 import base64
+import gzip
 import json
 
 SECRET = "test-secret-0123456789abcdef"
@@ -103,3 +104,12 @@ def sqs_event(bodies, *, message_ids=None):
             }
         )
     return {"Records": records}
+
+
+def pack(lines):
+    """Gzip newline-delimited JSON, one envelope per line, trailing newline.
+
+    Mirrors what src/archiver/archiver.yaml writes (the `parse_batch` mapping followed by
+    the gzip `compress` processor); src/archiver/archiver_bento_test.yaml pins that side.
+    """
+    return gzip.compress(("\n".join(lines) + "\n").encode("utf-8"))

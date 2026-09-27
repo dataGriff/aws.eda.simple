@@ -1,1 +1,0 @@
-# Intentionally empty: boto3 is provided by the python3.12 Lambda runtime.

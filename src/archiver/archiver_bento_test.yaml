@@ -1,0 +1,128 @@
+# Unit tests for archiver.yaml, run with `bento test src/archiver` (part of `task test`).
+# Each test feeds one Lambda event through a slice of the config and checks what comes out.
+# No AWS: the S3 output is never exercised here.
+
+tests:
+  - name: envelopes are archived verbatim, one compact line each, trailing newline
+    target_processors: /pipeline/processors
+    environment:
+      ARCHIVE_PREFIX: events/
+    input_batch:
+      - json_content:
+          Records:
+            - messageId: m-1
+              body: '{"version":"0","id":"bus-1","detail-type":"order.created","source":"com.example.shop","time":"2026-09-26T14:47:03Z","detail":{"id":"evt_1","type":"order.created","timestamp":"2026-09-26T14:47:03Z","data":{"order_id":"ord_1","total":19.98,"items":[{"sku":"SKU-1","qty":2}]}}}'
+            - messageId: m-2
+              body: '{"version":"0","id":"bus-2","detail-type":"payment.received","source":"com.example.shop","time":"2026-09-26T14:47:09Z","detail":{"id":"evt_2","type":"payment.received","timestamp":"2026-09-26T14:47:09Z","data":{"payment_id":"pay_1","amount":19.98}}}'
+    output_batches:
+      - - bloblang: |
+            let lines = content().decompress("gzip").string().split("\n")
+            root = $lines.length() == 3 &&
+            $lines.index(2) == "" &&
+            $lines.index(0) == "{\"version\":\"0\",\"id\":\"bus-1\",\"detail-type\":\"order.created\",\"source\":\"com.example.shop\",\"time\":\"2026-09-26T14:47:03Z\",\"detail\":{\"id\":\"evt_1\",\"type\":\"order.created\",\"timestamp\":\"2026-09-26T14:47:03Z\",\"data\":{\"order_id\":\"ord_1\",\"total\":19.98,\"items\":[{\"sku\":\"SKU-1\",\"qty\":2}]}}}" &&
+            $lines.index(1) == "{\"version\":\"0\",\"id\":\"bus-2\",\"detail-type\":\"payment.received\",\"source\":\"com.example.shop\",\"time\":\"2026-09-26T14:47:09Z\",\"detail\":{\"id\":\"evt_2\",\"type\":\"payment.received\",\"timestamp\":\"2026-09-26T14:47:09Z\",\"data\":{\"payment_id\":\"pay_1\",\"amount\":19.98}}}"
+          metadata_equals:
+            received: 2
+            archived: 2
+            failed: []
+
+  - name: a body that spans lines is re-serialised onto one line, a padded one is trimmed
+    target_processors: /pipeline/processors
+    input_batch:
+      - json_content:
+          Records:
+            - messageId: m-1
+              body: "{\n  \"id\": \"bus-1\",\n  \"n\": 1\n}"
+            - messageId: m-2
+              body: "  {\"z\":1,\"a\":2}  "
+    output_batches:
+      - - bloblang: |
+            let lines = content().decompress("gzip").string().split("\n")
+            root = $lines.index(0).parse_json() == {"id":"bus-1","n":1} &&
+              !$lines.index(0).contains("\n") &&
+              $lines.index(1) == "{\"z\":1,\"a\":2}" &&
+              $lines.length() == 3
+
+  - name: object key partitions by day and stamps the batch, under ARCHIVE_PREFIX
+    target_processors: /pipeline/processors
+    environment:
+      ARCHIVE_PREFIX: custom/
+    input_batch:
+      - json_content:
+          Records:
+            - messageId: m-1
+              body: '{"id":"bus-1"}'
+    output_batches:
+      - - bloblang: |
+            root = @key.re_match("^custom/dt=\\d{4}-\\d{2}-\\d{2}/\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z-[0-9a-f-]{36}\\.jsonl\\.gz$") &&
+            @key.contains("dt=" + now().ts_tz("UTC").ts_format("2006-01-02"))
+
+  - name: a body that is not a JSON object is reported by message id, the rest is archived
+    target_processors: /pipeline/processors
+    input_batch:
+      - json_content:
+          Records:
+            - messageId: good-a
+              body: '{"id":"bus-a"}'
+            - messageId: bad-not-json
+              body: '{not json'
+            - messageId: bad-string
+              body: '"a bare string"'
+            - messageId: bad-array
+              body: '[1, 2, 3]'
+            - messageId: good-b
+              body: '{"id":"bus-b"}'
+    output_batches:
+      - - bloblang: 'root = content().decompress("gzip").string() == "{\"id\":\"bus-a\"}\n{\"id\":\"bus-b\"}\n"'
+          metadata_equals:
+            received: 5
+            archived: 2
+            failed: [bad-not-json, bad-string, bad-array]
+
+  - name: nothing archivable leaves an empty body and every id in failed
+    target_processors: /pipeline/processors
+    input_batch:
+      - json_content:
+          Records:
+            - messageId: m1
+              body: nope
+    output_batches:
+      - - bloblang: 'root = content().decompress("gzip").string() == ""'
+          metadata_equals:
+            received: 1
+            archived: 0
+            failed: [m1]
+
+  - name: an empty batch is harmless
+    target_processors: /pipeline/processors
+    input_batch:
+      - json_content:
+          Records: []
+    output_batches:
+      - - metadata_equals:
+            received: 0
+            archived: 0
+            failed: []
+
+  # The response Lambda returns to SQS: only the failed ids, in the ReportBatchItemFailures shape.
+  - name: the response lists only the failed messages
+    target_processors: /output/switch/cases/1/output/broker/outputs/1/processors
+    input_batch:
+      - content: ""
+        metadata:
+          failed: [bad-1, bad-2]
+    output_batches:
+      - - json_equals:
+            batchItemFailures:
+              - itemIdentifier: bad-1
+              - itemIdentifier: bad-2
+
+  - name: a clean batch answers with an empty failure list
+    target_processors: /output/switch/cases/0/output/processors
+    input_batch:
+      - content: ""
+        metadata:
+          failed: []
+    output_batches:
+      - - json_equals:
+            batchItemFailures: []

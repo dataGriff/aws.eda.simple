@@ -27,8 +27,15 @@ vars:
   LOCAL_AWS_ENV: "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION={{.REGION}}"
   LOCAL_IMAGE: floci/floci:latest
   LOCAL_SECRET: local-dev-secret-0123456789
-  # Separate build dir so a local build never overwrites an AWS one (or vice versa).
+  # Separate build dir so a local build never overwrites an AWS one (or vice versa). The
+  # cache dir is separate too: the archiver's build artifact is a native binary, and SAM's
+  # cache key is the source hash, which does not know which architecture it was built for.
   LOCAL_BUILD_DIR: .aws-sam/local
+  LOCAL_CACHE_DIR: .aws-sam/local-cache
+  # Floci runs functions on the host's architecture, so the archiver's Bento binary must be
+  # fetched for the host, not for AWS's arm64 (src/archiver/Makefile reads BENTO_ARCH).
+  HOST_ARCH:
+    sh: uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/'
   LOCAL_BUCKET: "{{.STACK}}-lake-000000000000-{{.REGION}}"
   LOCAL_ARCHIVE: "s3://{{.LOCAL_BUCKET}}/events/**/*.jsonl.gz"
   EXPECT: 30
@@ -56,10 +63,11 @@ tasks:
       - "{{.PY}} -m pip install --quiet -r requirements-dev.txt"
 
   lint:
-    desc: Run ruff lint + format check
+    desc: Run ruff lint + format check, and lint the Bento archiver config
     cmds:
       - "{{.PY}} -m ruff check ."
       - "{{.PY}} -m ruff format --check ."
+      - bento lint --skip-env-var-check src/archiver/archiver.yaml
 
   fmt:
     desc: Auto-fix lint and format
@@ -68,9 +76,10 @@ tasks:
       - "{{.PY}} -m ruff format ."
 
   test:
-    desc: Run unit tests (no AWS needed)
+    desc: Run unit tests - pytest for the webhook, generator and views, bento test for the archiver (no AWS needed)
     cmds:
       - "{{.PY}} -m pytest"
+      - bento test ./src/...
 
   validate:
     desc: Validate the SAM template
@@ -197,7 +206,7 @@ tasks:
       - sam local invoke WebhookFunction -e events/post.json --env-vars env.json
 
   invoke:archiver:
-    desc: Invoke the archiver in a local container with events/sqs.json (needs env.json, writes to real S3)
+    desc: Invoke the archiver in a local container with events/sqs.json (needs env.json, writes to real S3; arm64 host or QEMU)
     cmds:
       - sam local invoke ArchiverFunction -e events/sqs.json --env-vars env.json
 
@@ -235,9 +244,11 @@ tasks:
           sleep 2
         done
         echo "Floci did not come up in time"; docker logs floci-main | tail -20; exit 1
-      # Pull the Lambda runtime image now rather than inside the first invocation: on a fresh
-      # machine or CI runner that pull is ~780 MB and would otherwise eat the first request.
+      # Pull the Lambda runtime images now rather than inside the first invocation: on a fresh
+      # machine or CI runner the Python pull is ~780 MB and would otherwise eat the first
+      # request. provided:al2023 is the archiver's (Bento, custom runtime).
       - docker pull -q public.ecr.aws/lambda/python:3.12
+      - docker pull -q public.ecr.aws/lambda/provided:al2023
 
   local:down:
     desc: Stop and remove Floci (deletes everything in it)
@@ -250,10 +261,14 @@ tasks:
 
   local:deploy:
     desc: Build and deploy the stack into Floci
-    env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test, AWS_DEFAULT_REGION: "{{.REGION}}" }
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: "{{.REGION}}"
+      BENTO_ARCH: "{{.HOST_ARCH}}"
     cmds:
       # SAM looks for samconfig.toml next to the template, so name it when building elsewhere.
-      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
+      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}} --cache-dir {{.LOCAL_CACHE_DIR}}
       - samlocal deploy --config-env local --config-file {{.ROOT_DIR}}/samconfig.toml --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
       # Floci gap (2.1.0): its CloudFormation drops MaximumBatchingWindowInSeconds and
       # FunctionResponseTypes from AWS::Lambda::EventSourceMapping. Re-apply them through the
@@ -353,7 +368,9 @@ tasks:
       - defer: { task: local:down }
       - task: local:deploy
       - task: local:generate
-      - echo "waiting 45s for the archiver's batching window" && sleep 45
+      # 30s batching window, plus the archiver's first cold start: Floci copies its 245 MB
+      # binary into a code volume before the first invocation.
+      - echo "waiting 60s for the archiver's batching window and cold start" && sleep 60
       - task: local:verify
 
   # ------------------------------------------------------------------ internal

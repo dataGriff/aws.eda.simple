@@ -6,7 +6,7 @@ A small, complete event-driven architecture on AWS that also runs, end to end, o
 2. The webhook is a **Lambda function exposed through a Function URL**, protected by a shared-secret header.
 3. The Lambda validates the events and publishes them to a **custom Amazon EventBridge bus** with `PutEvents`.
 4. A **catch-all rule** on the bus fans every event out to two targets: a **CloudWatch log group** so you can watch the pipeline work, and an **SQS queue** so you can keep the events.
-5. An **archiver Lambda** drains the queue in batches and writes each batch to **S3 as gzipped JSON Lines** - the bus envelope, byte for byte, nothing transformed.
+5. An **archiver Lambda** drains the queue in batches and writes each batch to **S3 as gzipped JSON Lines** - the bus envelope, byte for byte, nothing transformed. It is a [**Bento**](https://warpstreamlabs.github.io/bento/) stream running as a Lambda: a YAML config and Bento's own binary, no code of ours.
 6. You query the archive with **DuckDB**, straight from the files. Any engine that reads JSON on S3 can do the same.
 
 ```mermaid
@@ -16,28 +16,33 @@ flowchart LR
     L -- "PutEvents (≤10 per call)" --> B[(EventBridge bus<br/>simple-eda-bus)]
     B -- "CatchAllRule<br/>source = com.example.shop" --> C[CloudWatch Logs<br/>/aws/events/simple-eda-bus]
     B -- "CatchAllRule<br/>same pattern, 2nd target" --> Q[SQS<br/>ArchiveQueue]
-    Q -- "batches of ≤100 / 30s" --> A[ArchiverFunction]
+    Q -- "batches of ≤100 / 30s" --> A[ArchiverFunction<br/>Bento on provided.al2023]
     A --> S[(S3<br/>events/dt=…/*.jsonl.gz)]
     S --> D[DuckDB<br/>read_json]
     Q -. "3 failed receives" .-> X[SQS<br/>dead-letter queue]
 ```
 
-Everything is deployed with **AWS SAM** from a single `template.yaml`, with no prerequisites beyond AWS credentials - or into **Floci**, a free local AWS emulator, with no AWS account at all. Both Lambdas have **no third-party dependencies** (boto3 ships with the runtime).
+Everything is deployed with **AWS SAM** from a single `template.yaml`, with no prerequisites beyond AWS credentials - or into **Floci**, a free local AWS emulator, with no AWS account at all. The webhook Lambda is plain Python with **no third-party dependencies** (boto3 ships with the runtime); the archiver is a Bento config plus Bento's Lambda build, which `sam build` downloads.
+
+This branch is the **Bento experiment**: the archiver was rewritten from Python to a Bento stream to see whether the solution gets better. The verdict, and why the webhook stayed Python, is in [bento.md](bento.md).
 
 ## Project layout
 
 ```
 template.yaml               SAM template: bus, Lambdas, IAM, rule, log groups, bucket, queues
 samconfig.toml              SAM CLI defaults; [local] env targets Floci
-mise.toml                   Every tool, pinned: python, task, duckdb, awscli, sam, samlocal
+mise.toml                   Every tool, pinned: python, task, duckdb, awscli, sam, samlocal, bento
 Taskfile.yml                Every command: `task --list`. CI calls the same tasks you do
 src/webhook/app.py          Webhook handler and pure helper functions
-src/archiver/app.py         Archiver: SQS batch of bus envelopes -> one gzipped JSON Lines file on S3
+src/archiver/archiver.yaml  Archiver, as a Bento stream: SQS batch of bus envelopes -> one gzipped JSON Lines file on S3
+src/archiver/*_bento_test.yaml  Unit tests for that config, run by `bento test`
+src/archiver/Makefile       `sam build` recipe: fetch the pinned Bento Lambda binary, stage it with the config
+bento.md                    The evaluation: what Bento improved, what it cost, why the webhook is still Python
 generator/generate.py       Fake data generator CLI (runs locally, not deployed)
 queries/views.sql           DuckDB views over the archive (events, orders, order_items, payments)
 queries/examples.sql        Example analytical queries, runnable with `task query`
 guide.md                    Build this yourself: the solution as nine ordered tasks, with the gotchas
-tests/                      pytest unit tests (botocore Stubber + DuckDB, no AWS account needed)
+tests/                      pytest unit tests for the webhook, generator and views (botocore Stubber + DuckDB, no AWS)
 events/post.json            Sample Function URL event for `sam local invoke`
 events/sqs.json             Sample SQS batch for `sam local invoke`
 env.example.json            Template for local env vars (copy to env.json, git-ignored)
@@ -77,7 +82,8 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 
 ## Prerequisites
 
-- [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, Harlequin, the AWS CLI, SAM and `samlocal`
+- [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, Harlequin, the AWS CLI, SAM, `samlocal` and the `bento` CLI
+- `curl`, `unzip` and `make` - `sam build` uses them to fetch the Bento Lambda binary (present on macOS and every Linux)
 - To deploy to AWS: an AWS account and credentials configured for the AWS CLI
 - To run it locally instead: Docker. [Floci](https://floci.io) needs no account and no token
 
@@ -88,7 +94,7 @@ No account-level setup is needed for AWS. `task deploy` is the whole story.
 ```bash
 mise install            # tools from mise.toml
 task install            # creates .venv and installs dev dependencies
-task ci                 # ruff + 80-odd unit tests + sam validate, no AWS needed
+task ci                 # ruff + bento lint, 70-odd pytest tests + 8 bento tests, sam validate; no AWS needed
 task --list             # everything else
 ```
 
@@ -109,7 +115,7 @@ or step by step, leaving Floci up to poke at:
 task local:up           # docker run floci/floci, healthy in a few seconds
 task local:deploy       # samlocal build + deploy (samconfig.toml [local] env)
 task local:generate     # 10 POSTs, 3 events each, at the local Function URL
-sleep 45                # the archiver batches for up to 30s
+sleep 60                # the archiver batches for up to 30s, and its first start copies a 245 MB binary
 task local:verify       # DuckDB counts the archived events: expects 30
 task local:query        # runs queries/examples.sql over the local archive
 task local:duckdb       # or interactively
@@ -138,6 +144,7 @@ found by running it and visible in `docker logs floci-main` or the resource list
 | CloudFormation drops `MaximumBatchingWindowInSeconds` and `FunctionResponseTypes` from the event source mapping | one archiver invocation per event | `task local:deploy` re-applies both through the Lambda API; the window then works (one file per 30s batch) |
 | `ReportBatchItemFailures` is ignored at runtime | a message the archiver rejects is dropped with its batch instead of retried and dead-lettered | nothing possible from here; `task local:errors` will always report 0 |
 | EventBridge → CloudWatch Logs target unsupported | `task local:logs:events` shows nothing | the archive is the record: `task local:logs:archiver` and `task local:archive` show the flow |
+| Functions run on the host's architecture, not the template's `arm64` (by design; `FLOCI_SERVICES_LAMBDA_HONOUR_ARCHITECTURES` needs QEMU) | invisible for Python; the archiver's Bento binary is native and must match | `task local:deploy` builds with `BENTO_ARCH` set to the host's architecture, into its own build *and* cache directory - SAM's build cache keys on source only and would happily reuse an arm64 binary for an x86 host |
 
 None of these affect AWS. If you need to exercise the dead-letter path or the log-group tail locally, the
 LocalStack variant of this repo (`feat/sqs-archiver`, PR #2) does both faithfully, at the cost of an auth token
@@ -245,12 +252,13 @@ SELECT sku, sum(qty) AS units FROM order_items GROUP BY 1 ORDER BY 2 DESC LIMIT 
 ### How the archive is laid out
 
 ```
-s3://<bucket>/events/dt=2026-09-27/2026-09-27T20-51-46Z-<lambda-request-id>.jsonl.gz
+s3://<bucket>/events/dt=2026-09-27/2026-09-27T20-51-46Z-<uuid>.jsonl.gz
 ```
 
 One file per archiver invocation: up to 100 events or 30 seconds' worth, whichever came first. Each line is one
-EventBridge envelope exactly as the bus delivered it. `dt=` is a Hive-style partition DuckDB prunes on; the
-timestamp in the name is when the batch was written.
+EventBridge envelope exactly as the bus delivered it - the bytes of the SQS message body, not a re-serialisation.
+`dt=` is a Hive-style partition DuckDB prunes on; the timestamp in the name is when the batch was written. The
+uuid stands in for the Lambda request id, which Bento does not see.
 
 ### How DuckDB reads it
 
@@ -316,10 +324,17 @@ alone. In Athena or Trino the unnest above becomes
 ## Local development
 
 - `task lint`, `task fmt`, `task test`, `task validate` (`sam validate --lint`), or all three checks with `task ci`.
-- `tests/test_archive_query.py` writes archive files with the archiver's own code and queries them through
-  `queries/views.sql` with the DuckDB Python package - so the SQL is tested offline, against the real file format.
+- `bento test ./src/...` (part of `task test`) runs `src/archiver/archiver_bento_test.yaml`: Lambda events in,
+  the gzipped lines, the object key and the `batchItemFailures` response out. `bento lint` is part of `task lint`.
+- `tests/test_archive_query.py` writes archive files in the archiver's format (`tests/helpers.py::pack`) and queries
+  them through `queries/views.sql` with the DuckDB Python package - so the SQL is tested offline, against the real
+  file format. The Bento tests pin the format from the other side.
+- To try the archiver binary itself without Docker, run Bento's `bootstrap` under the
+  [Lambda Runtime Interface Emulator](https://github.com/aws/aws-lambda-runtime-interface-emulator) with
+  `BENTO_CONFIG_PATH`, `ARCHIVE_BUCKET` and an `AWS_ENDPOINT_URL` pointing at any S3-compatible endpoint, and POST
+  `events/sqs.json` to it. That is how the response shapes in `bento.md` were checked.
 - `task invoke:webhook` runs the webhook handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. The handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
-- `task invoke:archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. For a fully local run use the Floci targets above instead.
+- `task invoke:archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. The build is `arm64`, so this needs an arm64 host (Apple Silicon) or QEMU. For a fully local run use the Floci targets above instead.
 - `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
 
 ## Security notes
@@ -346,6 +361,8 @@ task delete             # sam delete, removes the stack including log groups and
 - `PutEvents` accepts at most 10 entries per call, so requests are chunked; failures are reported with their index in the original request.
 - The CloudWatch Logs target needs an `AWS::Logs::ResourcePolicy` and the SQS target needs an `AWS::SQS::QueuePolicy`, both allowing `events.amazonaws.com`. Without either, the rule deploys but that target silently delivers nothing. The queue policy pins `aws:SourceArn` to this one rule, with the ARN built by `!Sub` so the rule can `DependsOn` the policy without a cycle.
 - **There is no transform.** Files have no schema to match, so the archiver writes the envelope exactly as delivered and `queries/views.sql` does the renaming. Compare this with feeding a typed table: every consumer of a typed table pays for the schema up front; every consumer of the archive pays only for the fields it reads.
-- The archiver returns `batchItemFailures` (`ReportBatchItemFailures` on the event source), so a message whose body is not a JSON object is retried and eventually dead-lettered on its own, while the rest of its batch is archived. An S3 write failure raises, which redelivers the whole batch - hence the dedupe in the `events` view.
+- The archiver is `src/archiver/archiver.yaml`, run by Bento's Lambda build (`bootstrap`, `provided.al2023`): a `mapping` splits the SQS batch into archive lines and failed message ids (kept in metadata), `compress` gzips, and a `switch` output writes to `aws_s3` and answers through `sync_response`, or only answers when nothing was archivable. The Lambda's response is whatever reaches `sync_response`.
+- It returns `batchItemFailures` (`ReportBatchItemFailures` on the event source), so a message whose body is not a JSON object is retried and eventually dead-lettered on its own, while the rest of its batch is archived. A failed S3 write is retried by Bento until the Lambda times out, after which SQS redelivers the whole batch - hence the dedupe in the `events` view.
+- `sam build` runs `src/archiver/Makefile` (`BuildMethod: makefile`): it downloads the pinned Bento release once into `~/.cache/bento-lambda`, checks its sha256, and stages `bootstrap` plus the config. `BENTO_ARCH` picks the binary (`arm64` for AWS, the host's for Floci).
 - The queue is the buffer. Its 14-day retention means a broken archiver loses nothing for two weeks; the dead-letter queue keeps what the archiver rejected three times.
 - `tests/test_generator.py` feeds the generator's output through the webhook's own `validate_event`, so the two sides of the contract cannot drift apart. `tests/test_archive_query.py` extends the chain to the end: generator → `to_entry` → bus envelope → archiver → file → DuckDB view, asserting the original event comes back out.

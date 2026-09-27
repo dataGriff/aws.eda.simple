@@ -8,3 +8,7 @@ awscli = "latest"
 aws-sam-cli = "latest"
 "pypi:aws-sam-cli-local" = "latest"   # samlocal: points SAM at LocalStack
 "pypi:harlequin" = "latest"           # SQL IDE in the terminal, DuckDB adapter built in
+# The archiver is a Bento config; the CLI lints and unit-tests it (`task ci`). Pinned to the
+# release src/archiver/Makefile ships in the Lambda, so tests run the code that deploys.
+# `matching` keeps mise off the lambda/bootstrap assets of the same release.
+"github:warpstreamlabs/bento" = { version = "1.21.2", matching = "bento_" }

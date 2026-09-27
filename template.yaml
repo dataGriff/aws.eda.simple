@@ -4,7 +4,8 @@ Description: >
   aws.eda.simple - a webhook Lambda (Function URL) that publishes inbound JSON events
   to a custom Amazon EventBridge bus. A catch-all rule fans every event out to a
   CloudWatch log group (so the pipeline can be observed end-to-end) and to an SQS queue
-  drained by a Lambda that archives each batch to S3 as gzipped JSON Lines.
+  drained by a Bento stream running as a Lambda that archives each batch to S3 as
+  gzipped JSON Lines.
 
 Parameters:
   WebhookSecret:
@@ -197,17 +198,30 @@ Resources:
 
   # Drains the queue in batches and writes each batch as one file. The envelope is archived
   # untouched: files have no schema to match, so there is nothing to transform.
+  #
+  # This function is a Bento stream (https://warpstreamlabs.github.io/bento), not Python:
+  # the code is src/archiver/archiver.yaml and the runtime is Bento's Lambda build, a single
+  # static binary named `bootstrap` on the provided.al2023 custom runtime. `sam build` runs
+  # src/archiver/Makefile, which downloads the pinned release and stages both files.
   ArchiverFunction:
     Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
     Properties:
-      Description: Archives batches of bus events to S3 as gzipped JSON Lines.
+      Description: Archives batches of bus events to S3 as gzipped JSON Lines (Bento).
       CodeUri: src/archiver/
-      Handler: app.lambda_handler
+      Runtime: provided.al2023
+      Handler: bootstrap
       Timeout: 60
+      # The Bento binary is ~230 MB with every component compiled in; more memory means more
+      # CPU for the cold start, which is where it is spent.
+      MemorySize: 512
       Environment:
         Variables:
           ARCHIVE_BUCKET: !Ref LakeBucket
           ARCHIVE_PREFIX: events/
+          # Bento looks for ./bento.yaml by default; name the file explicitly instead.
+          BENTO_CONFIG_PATH: /var/task/archiver.yaml
           LOG_LEVEL: INFO
       Events:
         Archive:
