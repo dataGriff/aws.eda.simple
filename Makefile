@@ -9,8 +9,10 @@ WEBHOOK_SECRET ?=
 # answer DuckDB's background-colour probe.
 DUCKDB_FLAGS ?=
 QUERY_FILE ?= queries/examples.sql
-# LocalStack (make local-*). The auth token, if you have one, comes from the environment.
+# LocalStack (make local-*): plain `docker run`, the same locally and in CI. LocalStack needs
+# an auth token even for its free tier - export LOCALSTACK_AUTH_TOKEN (never commit it).
 LOCAL_ENDPOINT ?= http://localhost:4566
+LOCAL_IMAGE    ?= localstack/localstack
 LOCAL_SECRET   ?= local-dev-secret-0123456789
 EXPECT         ?= 30
 
@@ -125,18 +127,21 @@ delete: ## Delete the stack (run empty-bucket first)
 
 # ------------------------------------------------------------------ LocalStack
 # The whole pipeline on your machine: no AWS account, no WEBHOOK_SECRET.
-# Needs docker, the localstack CLI and samlocal (see requirements-dev.txt).
+# Needs docker and samlocal (pip install aws-sam-cli-local).
 
-local-up: ## Start LocalStack in the background (export LOCALSTACK_AUTH_TOKEN first if you have one)
-	LAMBDA_IGNORE_ARCHITECTURE=1 localstack start -d
+local-up: ## Start LocalStack in Docker and wait until it is healthy (needs LOCALSTACK_AUTH_TOKEN)
+	@test -n "$$LOCALSTACK_AUTH_TOKEN" || { echo "LOCALSTACK_AUTH_TOKEN is not set. LocalStack needs one even on its free tier: https://app.localstack.cloud"; exit 1; }
+	docker run -d --name localstack-main -p 4566:4566 \
+		-e LAMBDA_IGNORE_ARCHITECTURE=1 -e LOCALSTACK_AUTH_TOKEN \
+		-v /var/run/docker.sock:/var/run/docker.sock $(LOCAL_IMAGE)
 	@echo "waiting for $(LOCAL_ENDPOINT) ..."; \
 	for i in $$(seq 1 60); do \
 		curl -sf $(LOCAL_ENDPOINT)/_localstack/health >/dev/null && { echo "LocalStack is up"; exit 0; }; \
 		sleep 2; \
-	done; echo "LocalStack did not come up in time"; exit 1
+	done; echo "LocalStack did not come up in time"; docker logs localstack-main | tail -20; exit 1
 
-local-down: ## Stop LocalStack (deletes everything in it)
-	localstack stop
+local-down: ## Stop and remove LocalStack (deletes everything in it)
+	docker rm -f localstack-main
 
 local-deploy: ## Build and deploy the stack into LocalStack
 	samlocal build
@@ -171,4 +176,5 @@ local-verify: ## Assert the LocalStack archive holds EXPECT events (default 30);
 		-cmd "$(DUCKDB_INSTALL) $(DUCKDB_LOCAL) SET VARIABLE archive = 's3://$(STACK)-lake-000000000000-$(REGION)/events/**/*.jsonl.gz';" \
 		-cmd ".read queries/views.sql" \
 		-c "SELECT count(*) FROM events;" | tail -1); \
+	case "$$N" in ''|*[!0-9]*) echo "count query failed (got '$$N')"; exit 1;; esac; \
 	echo "events archived: $$N (expected $(EXPECT))"; test "$$N" = "$(EXPECT)"

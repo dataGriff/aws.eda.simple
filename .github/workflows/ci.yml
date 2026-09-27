@@ -58,20 +58,18 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
-      - name: Install SAM, samlocal and the localstack CLI
-        run: pip install -r requirements-dev.txt aws-sam-cli aws-sam-cli-local localstack
+      - name: Install SAM and samlocal
+        run: pip install -r requirements-dev.txt aws-sam-cli aws-sam-cli-local
 
       - name: Install the DuckDB CLI
         run: |
           curl -sSL -o duckdb.zip https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
           unzip -q duckdb.zip duckdb && sudo mv duckdb /usr/local/bin/ && duckdb --version
 
-      - uses: LocalStack/setup-localstack@v0.3.2
-        with:
-          image-tag: latest
-          install-awslocal: false
-          # The functions are arm64; run them on the x86 runner anyway.
-          configuration: LAMBDA_IGNORE_ARCHITECTURE=1
+      # Same `docker run` a developer uses. LocalStack needs an auth token even on its
+      # free tier, so this job requires the LOCALSTACK_AUTH_TOKEN repository secret.
+      - name: Start LocalStack
+        run: make local-up
         env:
           LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
 

@@ -79,7 +79,7 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 - To query the archive: the [DuckDB CLI](https://duckdb.org/docs/installation/) (`brew install duckdb`)
 - To deploy to AWS: an AWS account and credentials configured for the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-- To run it locally instead: Docker, plus `pip install localstack aws-sam-cli-local` (the `localstack` CLI and `samlocal`)
+- To run it locally instead: Docker, `pip install aws-sam-cli-local` (`samlocal`, which points SAM at LocalStack), and a free [LocalStack](https://app.localstack.cloud) auth token
 
 No account-level setup is needed for AWS. `make deploy` is the whole story.
 
@@ -97,7 +97,7 @@ The pipeline runs unchanged in [LocalStack](https://localstack.cloud): same temp
 generator, same DuckDB queries. No AWS account, no secret to generate.
 
 ```bash
-make local-up           # starts LocalStack in Docker
+make local-up           # docker run localstack/localstack, waits for healthy
 make local-deploy       # samlocal build + deploy (samconfig.toml [local] env)
 make local-generate     # 10 POSTs, 3 events each, at the local Function URL
 sleep 45                # the archiver batches for up to 30s
@@ -111,11 +111,12 @@ make local-down
 how LocalStack routes Function URLs anyway - so it works even where your resolver refuses the
 `*.localhost.localstack.cloud` wildcard (some ISPs block DNS answers that point at 127.0.0.1).
 
-LocalStack now expects an account: export `LOCALSTACK_AUTH_TOKEN` before `make local-up` (the free Hobby
-tier is enough; the token lives in your shell, never in the repo). Without one it still starts during
-LocalStack's grace period if you set `LOCALSTACK_ACKNOWLEDGE_ACCOUNT_REQUIREMENT=1`. `LAMBDA_IGNORE_ARCHITECTURE=1`
-is set for you so the `arm64` functions run on an x86 host. CI runs exactly this sequence on every push, with
-the token as a repository secret - see `.github/workflows/ci.yml`.
+`make local-up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
+free Hobby tier** (the image exits with "License activation failed" without one), so create an account at
+[app.localstack.cloud](https://app.localstack.cloud) and `export LOCALSTACK_AUTH_TOKEN=...` first. The token lives in
+your shell (or a CI secret), never in the repo. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64`
+functions run on an x86 host. CI runs exactly this sequence on every push, with the token as the
+`LOCALSTACK_AUTH_TOKEN` repository secret - see `.github/workflows/ci.yml`.
 
 ## Deploy to AWS
 

@@ -10,6 +10,6 @@ duckdb>=1.1
 # SAM CLI is needed for build/deploy. Uncomment to install via pip, or install
 # it with brew / pipx instead: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
 # aws-sam-cli>=1.120
-# Local run (make local-*): samlocal points SAM at LocalStack, localstack is its CLI.
+# Local run (make local-*): samlocal points SAM at LocalStack. LocalStack itself is
+# started with plain docker, so its CLI is not needed (and it conflicts with SAM's click pin).
 # aws-sam-cli-local>=1.0
-# localstack>=4
