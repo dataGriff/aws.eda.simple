@@ -46,7 +46,9 @@ untouched. Verified by running the real `bootstrap` binary under the
 S3: two envelopes → one object whose lines equal the SQS bodies, `Content-Type: application/x-ndjson`, no
 `Content-Encoding`; one good + one bad → `{"batchItemFailures":[{"itemIdentifier":"bad"}]}` and the good one
 archived; nothing archivable → no object, every id reported; empty batch → `{"batchItemFailures":[]}`; missing
-bucket → retried until the timeout. CI's Floci job is the end-to-end check.
+bucket → retried until the timeout. CI's Floci job is the end-to-end check, and it passed on the first run:
+30 events posted, 30 counted by DuckDB from the archive, on an x86 runner with the `amd64` build Floci needs,
+with no Floci-specific configuration - the injected `AWS_ENDPOINT_URL` was enough.
 
 ## Is the architecture right for Bento?
 
