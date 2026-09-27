@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  aws.eda.simple - a webhook Lambda (Function URL) that publishes inbound JSON events
+  to a custom Amazon EventBridge bus. A catch-all rule fans every event out to a
+  CloudWatch log group (so the pipeline can be observed end-to-end) and to an SQS queue
+  drained by a Lambda that archives each batch to S3 as gzipped JSON Lines.
+
+Parameters:
+  WebhookSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Shared secret callers must send in the X-Webhook-Secret header.
+  BusName:
+    Type: String
+    Default: simple-eda-bus
+    Description: Name of the custom EventBridge bus.
+  EventSource:
+    Type: String
+    Default: com.example.shop
+    Description: Value used for the EventBridge "source" field on every published event.
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Retention for the Lambda and event log groups.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 15
+    MemorySize: 256
+
+Resources:
+  # ------------------------------------------------------------------ EventBridge
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref BusName
+
+  # ------------------------------------------------------------------ Webhook Lambda
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Accepts JSON events over HTTPS and publishes them to the EventBridge bus.
+      CodeUri: src/webhook/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref EventBus
+          EVENT_SOURCE: !Ref EventSource
+          WEBHOOK_SECRET: !Ref WebhookSecret
+          MAX_EVENTS_PER_REQUEST: "100"
+          LOG_LEVEL: INFO
+      # Public HTTPS endpoint. SAM also creates the lambda:InvokeFunctionUrl permission.
+      # The shared secret header is checked inside the function.
+      FunctionUrlConfig:
+        AuthType: NONE
+      Policies:
+        - Statement:
+            - Sid: PutEventsToBus
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt EventBus.Arn
+
+  WebhookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WebhookFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ------------------------------------------------------------------ Observability
+  # Every event on the bus is copied to this log group so you can watch it flow.
+  EventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/events/${BusName}
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Required: EventBridge cannot write to a log group without a resource policy.
+  # Without this the rule deploys fine but delivers nothing (only FailedInvocations rises).
+  EventsLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-eventbridge-to-logs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowEventBridgeToWriteLogs",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]
+              },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "${EventsLogGroup.Arn}"
+            }
+          ]
+        }
+
+  # One rule, two targets: the log group for watching, the archive queue for keeping.
+  # Targets are independent, so a permission problem on one cannot stop the other.
+  CatchAllRule:
+    Type: AWS::Events::Rule
+    DependsOn: [EventsLogGroupPolicy, ArchiveQueuePolicy]
+    Properties:
+      Name: !Sub ${BusName}-catch-all
+      Description: Fan every event published by the webhook out to CloudWatch Logs and the archive queue.
+      EventBusName: !Ref EventBus
+      State: ENABLED
+      # An empty pattern {} is rejected; matching on our source is effectively catch-all.
+      EventPattern:
+        source:
+          - !Ref EventSource
+      Targets:
+        - Id: events-log-group
+          Arn: !GetAtt EventsLogGroup.Arn
+        # SQS targets are authorised by a queue policy (ArchiveQueuePolicy), not a role.
+        - Id: events-archive-queue
+          Arn: !GetAtt ArchiveQueue.Arn
+
+  # ------------------------------------------------------------------ Archive
+  # events/ holds the archive, one gzipped JSON Lines file per Lambda batch.
+  LakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-lake-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-multipart-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # The queue is the buffer: if the archiver is broken, events wait here for up to 14 days.
+  ArchiveQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-archive
+      # Six times the archiver's timeout, per the Lambda/SQS guidance.
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ArchiveDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  ArchiveDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-archive-dlq
+      MessageRetentionPeriod: 1209600
+
+  # Required: EventBridge cannot send to a queue without a queue policy - the same lesson as
+  # EventsLogGroupPolicy. Without this the target deploys but silently delivers nothing.
+  # The rule ARN is built rather than referenced so the rule can DependsOn this policy.
+  ArchiveQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ArchiveQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeToSendMessages
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ArchiveQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${BusName}/${BusName}-catch-all
+
+  # Drains the queue in batches and writes each batch as one file. The envelope is archived
+  # untouched: files have no schema to match, so there is nothing to transform.
+  ArchiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Archives batches of bus events to S3 as gzipped JSON Lines.
+      CodeUri: src/archiver/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET: !Ref LakeBucket
+          ARCHIVE_PREFIX: events/
+          LOG_LEVEL: INFO
+      Events:
+        Archive:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ArchiveQueue.Arn
+            # One file per invocation: 100 events or 30 seconds, whichever comes first.
+            BatchSize: 100
+            MaximumBatchingWindowInSeconds: 30
+            # Report only the messages that could not be archived; the rest are deleted.
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Policies:
+        - Statement:
+            - Sid: WriteArchive
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub ${LakeBucket.Arn}/events/*
+
+  ArchiverFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ArchiverFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  WebhookUrl:
+    Description: POST JSON events here with the X-Webhook-Secret header.
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  FunctionName:
+    Value: !Ref WebhookFunction
+  EventBusName:
+    Value: !Ref EventBus
+  EventBusArn:
+    Value: !GetAtt EventBus.Arn
+  LogGroupName:
+    Description: Log group receiving a copy of every event on the bus.
+    Value: !Ref EventsLogGroup
+  LakeBucketName:
+    Description: Bucket holding the archive under events/.
+    Value: !Ref LakeBucket
+  ArchiveLocation:
+    Description: S3 URI of the archive - DuckDB reads events/**/*.jsonl.gz under here.
+    Value: !Sub s3://${LakeBucket}/events/
+  ArchiveQueueUrl:
+    Value: !Ref ArchiveQueue
+  DeadLetterQueueUrl:
+    Description: Messages the archiver rejected three times. Should stay empty.
+    Value: !Ref ArchiveDeadLetterQueue
