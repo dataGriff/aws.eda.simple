@@ -1,7 +1,7 @@
 # SAM CLI configuration. The WebhookSecret parameter is deliberately NOT stored here;
 # `make deploy` passes it from the WEBHOOK_SECRET environment variable.
 # Note: --parameter-overrides on the CLI replaces this whole list, which is why the
-# Makefile passes BusName and EventSource as well.
+# Taskfile passes BusName and EventSource as well.
 version = 0.1
 
 [default.global.parameters]
