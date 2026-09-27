@@ -24,15 +24,12 @@ jobs:
       - run: task install
       - run: task ci
 
-  # The whole pipeline, for real, with no AWS credentials: deploy into LocalStack, post
-  # events at the webhook, and count what the archiver wrote with DuckDB.
-  localstack:
-    name: End-to-end in LocalStack
+  # The whole pipeline, for real, with no AWS credentials and no secrets at all: deploy into
+  # Floci, post events at the webhook, and count what the archiver wrote with DuckDB.
+  floci:
+    name: End-to-end in Floci
     runs-on: ubuntu-latest
     needs: test
-    env:
-      # LocalStack needs an auth token even on its free tier; this is the one secret CI has.
-      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 

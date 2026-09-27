@@ -9,8 +9,8 @@ not a requirement. The pipeline archives **any** JSON event that fits a small en
 domain-specific parts live in a handful of known places. The first section says exactly where, so you
 can build this for your own events from the start rather than retrofit.
 
-You need: a laptop with Docker, [mise](https://mise.jdx.dev), a free
-[LocalStack](https://app.localstack.cloud) auth token (from task 7), and an AWS account (only from task 8).
+You need: a laptop with Docker and [mise](https://mise.jdx.dev), and an AWS account (only from task 8). The
+local emulator, [Floci](https://floci.io), needs no account and no token.
 
 ```
 producer → Function URL → webhook Lambda → EventBridge bus ─┬─→ CloudWatch Logs               (watch)
@@ -43,7 +43,7 @@ new type or a new field inside `data` cannot break ingestion, archiving or the b
 | 5 | **Domain views** over the payload | `queries/views.sql` below the `events` view, `queries/examples.sql` | `orders`, `order_items`, `payments` |
 | 6 | The **contract table** in the README | README "Event contract" | the `type` row |
 
-Everything else - template, archiver, `events` view, LocalStack, CI, the inspection tasks - is
+Everything else - template, archiver, `events` view, the local emulator, CI, the inspection tasks - is
 domain-free and stays as it is.
 
 **Worked example.** Say your events are IoT sensor readings: `sensor.reading` with
@@ -78,7 +78,7 @@ read-side tests fail before anything is deployed.
 
 **Do**
 
-1. `mise.toml` pins the tools: `python = "3.12"`, `task`, `duckdb`, `awscli`, `aws-sam-cli`, `"pypi:aws-sam-cli-local"` (samlocal), `"pypi:harlequin"`. Run `mise install`.
+1. `mise.toml` pins the tools: `python = "3.12"`, `task`, `duckdb`, `awscli`, `aws-sam-cli`, `"pypi:aws-sam-cli-local"` (samlocal - despite the name it just points SAM at `localhost:4566`, so it works with any emulator on that port), `"pypi:harlequin"`. Run `mise install`.
 2. `Taskfile.yml` with `install` (venv + `pip install -r requirements-dev.txt`), `lint` (ruff check + format check), `fmt`, `test` (pytest), `validate` (`sam validate --lint`) and `ci` calling the three checks.
 3. `requirements-dev.txt`: `boto3`, `botocore`, `pytest`, `ruff`, `Faker`, `duckdb`. `pyproject.toml`: ruff at 100 columns with `E F I B UP S SIM`, pytest `pythonpath = ["src", "."]`.
 4. `dotenv: [".env"]` at the top of the Taskfile and `.env` in `.gitignore`: secrets live there locally and come from the environment in CI. Commands, preconditions and called tasks all see them.
@@ -86,7 +86,7 @@ read-side tests fail before anything is deployed.
 
 **Check:** `task ci` passes with zero tests. Push; CI is green.
 
-> **Why:** every command lives in the Taskfile and CI only calls tasks, so "works on my machine, fails in CI" has nowhere to hide; mise makes the tool versions part of the repo. **Gotcha:** a task's `env:` block applies to its own commands only, not to tasks it calls - pass values to helpers explicitly (you will hit this in task 7). **Gotcha:** do not install the `localstack` CLI into the same Python environment as SAM - their `click` pins conflict. You will not need that CLI.
+> **Why:** every command lives in the Taskfile and CI only calls tasks, so "works on my machine, fails in CI" has nowhere to hide; mise makes the tool versions part of the repo. **Gotcha:** a task's `env:` block applies to its own commands only, not to tasks it calls - pass values to helpers explicitly (you will hit this in task 7). **Gotcha:** keep emulator CLIs out of SAM's Python environment - `click` pins conflict. You will not need one: the emulator is a plain `docker run`.
 
 ---
 
@@ -98,7 +98,7 @@ read-side tests fail before anything is deployed.
 
 1. Write the envelope down first (the section above, and the README "Event contract"). Decide your `ALLOWED_TYPES` (yours #2) and your `EventSource` (yours #1).
 2. `src/webhook/app.py` as small pure functions: `is_authorized` (constant-time compare, case-insensitive header), `parse_body` (one object or an array of up to 100), `validate_event` (the four envelope fields, `type` in `ALLOWED_TYPES`, tz-aware `timestamp`, `data` an object, size ≤ 256 KB), `to_entry` (`detail-type` = `type`, `detail` = the whole event, `source` fixed per deployment and never from the payload), `chunk` (PutEvents takes 10 at a time), `put_events` (collect partial failures), and a `lambda_handler` that strings them together.
-3. `template.yaml`: `AWS::Events::EventBus`, the function with `FunctionUrlConfig: AuthType: NONE`, `WebhookSecret` as a `NoEcho` parameter, and an inline policy allowing `events:PutEvents` on that one bus.
+3. `template.yaml`: `AWS::Events::EventBus`, the function with `WebhookSecret` as a `NoEcho` parameter and an inline policy allowing `events:PutEvents` on that one bus, plus an explicit `AWS::Lambda::Url` (`AuthType: NONE`) and the `AWS::Lambda::Permission` for `lambda:InvokeFunctionUrl`. SAM's `FunctionUrlConfig` sugar expands to exactly those two on AWS, but Floci's SAM transform does not expand it - declaring them yourself works in both places.
 4. Tests with botocore's `Stubber` on the module-level client: 405 / 401 / 400 / 202 / 500, "one invalid event rejects the whole batch", "12 events use two PutEvents calls", partial failures reported with their original index. `sample_event()` in `tests/helpers.py` is your first payload (yours #4).
 
 **Check:** `task ci` green. Resist deploying until task 8.
@@ -172,27 +172,27 @@ read-side tests fail before anything is deployed.
 
 **Check:** `task test` runs the read-side tests with no AWS and no Docker.
 
-> **Why a SQL variable:** the same `views.sql` then serves S3, LocalStack and a temp directory - which is what makes the SQL testable. **Gotcha:** `read_json(..., maximum_depth=1)` looks like the way to keep `detail` as JSON, but it makes *every* top-level value JSON-typed and `event_type = 'x'` stops matching; declare `columns=` explicitly. **Gotcha:** when scripting a count with the DuckDB CLI, take the last output line and refuse anything non-numeric - `-cmd` statements print `Success` rows.
+> **Why a SQL variable:** the same `views.sql` then serves S3, the local emulator and a temp directory - which is what makes the SQL testable. **Gotcha:** `read_json(..., maximum_depth=1)` looks like the way to keep `detail` as JSON, but it makes *every* top-level value JSON-typed and `event_type = 'x'` stops matching; declare `columns=` explicitly. **Gotcha:** when scripting a count with the DuckDB CLI, take the last output line and refuse anything non-numeric - `-cmd` statements print `Success` rows.
 
 ---
 
-## Task 7 - Run the whole thing in LocalStack, then in CI
+## Task 7 - Run the whole thing in Floci, then in CI
 
-**Goal:** `task local:e2e` starts LocalStack, deploys the stack, posts events and asserts DuckDB counts them - no AWS credentials. CI runs the same task. Every inspection task gets a `local:` twin.
+**Goal:** `task local:e2e` starts Floci, deploys the stack, posts events and asserts DuckDB counts them - no AWS credentials, no tokens. CI runs the same task. Every inspection task gets a `local:` twin.
 
 **Do**
 
 1. `samconfig.toml` gains a `[local]` environment: same stack name, `resolve_s3 = true`, your `EventSource`, and a fixed non-secret `WebhookSecret` (it only ever guards localhost).
-2. `local:up`: `docker run -d --name localstack-main -p 4566:4566 -e LAMBDA_IGNORE_ARCHITECTURE=1 -e LOCALSTACK_AUTH_TOKEN -v /var/run/docker.sock:/var/run/docker.sock localstack/localstack`, then poll `/_localstack/health`. Preconditions: the token is set, and no `localstack-main` container already exists. `local:down`: `docker stop` then `docker rm -f`, then remove any `localstack-main-lambda-*` containers.
-3. `local:deploy`: `samlocal build --build-dir .aws-sam/local` and `samlocal deploy --config-env local --config-file <repo>/samconfig.toml --template-file .aws-sam/local/template.yaml` - a separate build dir so local and AWS builds never overwrite each other, and `--config-file` because SAM looks for `samconfig.toml` next to the template.
-4. `local:generate`: posts to `http://localhost:4566/` with the Function URL's hostname in the `Host` header (the generator's `--host`), because that is how LocalStack routes Function URLs and it sidesteps resolvers that refuse the `*.localhost.localstack.cloud` wildcard.
+2. `local:up`: `docker run -d --name floci-main -p 4566:4566 -e FLOCI_DEFAULT_REGION=<region> -v /var/run/docker.sock:/var/run/docker.sock floci/floci:latest`, then poll `/_floci/health` (up in a few seconds). Precondition: no `floci-main` container already exists. `local:down`: `docker stop`, `docker rm -f`, then remove the `floci-<stack>-*` Lambda containers Floci leaves behind.
+3. `local:deploy`: `samlocal build --build-dir .aws-sam/local` and `samlocal deploy --config-env local --config-file <repo>/samconfig.toml --template-file .aws-sam/local/template.yaml` - a separate build dir so local and AWS builds never overwrite each other, and `--config-file` because SAM looks for `samconfig.toml` next to the template. Then one Floci-specific step: `aws lambda update-event-source-mapping --maximum-batching-window-in-seconds 30 --function-response-types ReportBatchItemFailures` on the archiver's mapping, because Floci's CloudFormation drops both properties (see the parity notes below).
+4. `local:generate`: posts to `http://localhost:4566/` with the Function URL's hostname in the `Host` header (the generator's `--host`). Floci's URLs are `<id>.lambda-url.<region>.localhost:4566`, which resolves without DNS on most systems, so the plain URL works too; the header route is kept because it is emulator-independent.
 5. `local:outputs`, `local:resources`, `local:logs`, `local:logs:events`, `local:logs:archiver`, `local:queues`, `local:errors`, `local:archive`, `local:duckdb`, `local:query`, `local:harlequin`, `local:health`: the same internal helpers with `CLI: aws --endpoint-url http://localhost:4566` and dummy credentials, and the DuckDB secret `KEY_ID 'test', SECRET 'test', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path'`.
 6. `local:verify` asserts the DuckDB count equals `EXPECT`; `local:e2e` chains up → deploy → generate → wait 45s → verify, with a deferred `local:down`.
-7. CI: a second job with the `LOCALSTACK_AUTH_TOKEN` repository secret, `task install`, `task local:e2e`.
+7. CI: a second job with no secrets: `task install`, `task local:e2e`.
 
-**Check:** put `LOCALSTACK_AUTH_TOKEN=…` in `.env`; `task local:e2e` ends with `events archived: 30 (expected 30)`. Push; both CI jobs green. Then leave LocalStack up, `task local:resources`, `task local:queues`, `task local:archive`, and send a `not json` message to the queue by hand: `task local:logs:archiver FOLLOW=` shows `message_rejected` while good events keep flowing, and after three visibility timeouts `task local:errors` reports it in the DLQ.
+**Check:** `task local:e2e` ends with `events archived: 30 (expected 30)`. Push; both CI jobs green. Then leave Floci up and try `task local:resources`, `task local:queues`, `task local:archive`, `task local:logs:archiver FOLLOW=`.
 
-> **Why LocalStack works here at all:** SQS, Lambda, S3, EventBridge and Logs are all emulated with high fidelity, including SQS batching and partial-batch responses. The Firehose-to-Iceberg version this replaced could not run locally at all. **Gotcha:** LocalStack's image exits with "License activation failed" without an auth token, even on the free tier. **Gotcha:** the functions are `arm64`; `LAMBDA_IGNORE_ARCHITECTURE=1` lets an x86 runner execute them. **Gotcha:** tasks that call other tasks do not pass their `env:` along - the CI job found this as `NoCredentials` where the local run had inherited credentials from the shell.
+> **Why Floci works here:** CloudFormation with the SAM transform, Lambda in real Docker containers (on the host's architecture, so `arm64` functions run on x86 runners), Function URLs, SQS event source mappings, EventBridge → SQS, S3 - all present, starting in about three seconds with no account. **Parity gaps in 2.1.0, all characterised by running this pipeline:** (1) `FunctionUrlConfig` is not expanded - hence the explicit resources in task 2; (2) CloudFormation drops the mapping's batching window and response types - hence the post-deploy patch, after which batching works; (3) `ReportBatchItemFailures` is ignored at runtime, so a rejected message is dropped with its batch rather than retried and dead-lettered - `task local:errors` always reports 0; (4) the EventBridge → CloudWatch Logs target is unsupported, so `task local:logs:events` is empty. None affect AWS. The LocalStack variant of this repo (`feat/sqs-archiver`) has none of these gaps but needs an auth token and starts far slower - pick by what you need to exercise locally.
 
 ---
 
@@ -219,7 +219,7 @@ read-side tests fail before anything is deployed.
 - Pipeline lag: `task query` → the lag query compares `archived_at` (from the file name) with `event_time`. Expect roughly the batching window.
 - Something rejected: `task errors` shows the dead-letter depth; `task logs:archiver` shows `message_rejected` with the message id. Read the message from the DLQ, fix the producer, redrive.
 - Nothing arriving: `task resources` (everything `CREATE_COMPLETE`?), `task queues` (are events reaching SQS at all?), then the rule's `FailedInvocations` metric - the silent-failure signal for both targets.
-- Tear down: `task empty-bucket` (deliberately separate - it deletes the archive), then `task delete`. `task local:down` for LocalStack.
+- Tear down: `task empty-bucket` (deliberately separate - it deletes the archive), then `task delete`. `task local:down` for Floci.
 
 ---
 

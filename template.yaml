@@ -53,16 +53,29 @@ Resources:
           WEBHOOK_SECRET: !Ref WebhookSecret
           MAX_EVENTS_PER_REQUEST: "100"
           LOG_LEVEL: INFO
-      # Public HTTPS endpoint. SAM also creates the lambda:InvokeFunctionUrl permission.
-      # The shared secret header is checked inside the function.
-      FunctionUrlConfig:
-        AuthType: NONE
       Policies:
         - Statement:
             - Sid: PutEventsToBus
               Effect: Allow
               Action: events:PutEvents
               Resource: !GetAtt EventBus.Arn
+
+  # Public HTTPS endpoint; the shared secret header is checked inside the function.
+  # Declared explicitly rather than via SAM's FunctionUrlConfig, which expands to exactly
+  # these two resources on AWS but is not expanded by Floci's SAM transform.
+  WebhookFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt WebhookFunction.Arn
+      AuthType: NONE
+
+  WebhookFunctionUrlPublicAccess:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref WebhookFunction
+      Principal: "*"
+      FunctionUrlAuthType: NONE
 
   WebhookFunctionLogGroup:
     Type: AWS::Logs::LogGroup

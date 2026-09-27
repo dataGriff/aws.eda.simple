@@ -1,10 +1,10 @@
 # Single entry point for developers, AI agents and CI. Tools come from mise.toml.
 # `task --list` shows everything; `task ci` is what CI runs; `task local:e2e` is the
-# whole pipeline in LocalStack. Every AWS task has a `local:` twin that talks to LocalStack.
+# whole pipeline in Floci, a local AWS emulator. Every AWS task has a `local:` twin that talks to it.
 version: "3"
 
-# Local secrets live in .env (gitignored): LOCALSTACK_AUTH_TOKEN, WEBHOOK_SECRET.
-# Missing file is fine - CI has none and gets its secrets from the environment.
+# Local secrets live in .env (gitignored), e.g. WEBHOOK_SECRET. Missing file is fine -
+# CI has none and gets its secrets from the environment. Floci itself needs no token.
 dotenv: [".env"]
 
 vars:
@@ -19,13 +19,13 @@ vars:
   # Extra duckdb CLI flags, e.g. DUCKDB_FLAGS=-dark-mode if your terminal does not
   # answer DuckDB's background-colour probe.
   DUCKDB_FLAGS: ""
-  # LocalStack. The webhook secret here is deliberately not secret: it only ever guards
+  # Floci. The webhook secret here is deliberately not secret: it only ever guards
   # a webhook on localhost.
   LOCAL_ENDPOINT: http://localhost:4566
-  # Dummy credentials LocalStack accepts. Passed to helper tasks explicitly: a task's
+  # Dummy credentials Floci accepts. Passed to helper tasks explicitly: a task's
   # env: block applies to its own commands, not to tasks it calls.
   LOCAL_AWS_ENV: "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION={{.REGION}}"
-  LOCAL_IMAGE: localstack/localstack
+  LOCAL_IMAGE: floci/floci:latest
   LOCAL_SECRET: local-dev-secret-0123456789
   # Separate build dir so a local build never overwrites an AWS one (or vice versa).
   LOCAL_BUILD_DIR: .aws-sam/local
@@ -33,10 +33,10 @@ vars:
   LOCAL_ARCHIVE: "s3://{{.LOCAL_BUCKET}}/events/**/*.jsonl.gz"
   EXPECT: 30
   # The two ways to run the AWS CLI. Every inspection helper takes one of these as CLI,
-  # so a command exists once and works against AWS and LocalStack alike.
+  # so a command exists once and works against AWS and Floci alike.
   AWS_CLI: aws
   LOCAL_CLI: "{{.LOCAL_AWS_ENV}} aws --endpoint-url {{.LOCAL_ENDPOINT}}"
-  # DuckDB session set-up. One place, so the AWS and LocalStack query tasks cannot drift.
+  # DuckDB session set-up. One place, so the AWS and Floci query tasks cannot drift.
   DUCKDB_BOOT: "INSTALL httpfs; LOAD httpfs;"
   AWS_SECRET_SQL: "CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain, REGION '{{.REGION}}');"
   LOCAL_SECRET_SQL: "CREATE OR REPLACE SECRET (TYPE s3, KEY_ID 'test', SECRET 'test', REGION '{{.REGION}}', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path');"
@@ -214,50 +214,60 @@ tasks:
     cmds:
       - sam delete --stack-name {{.STACK}} --region {{.REGION}} --no-prompts
 
-  # ------------------------------------------------------------------ LocalStack
-  # The whole pipeline on your machine: no AWS account, no WEBHOOK_SECRET. LocalStack
-  # needs an auth token even on its free tier: export LOCALSTACK_AUTH_TOKEN.
+  # ------------------------------------------------------------------ Floci
+  # The whole pipeline on your machine: no AWS account, no WEBHOOK_SECRET, no auth token.
+  # Floci (https://floci.io) is a free AWS emulator; Lambda runs in real Docker containers.
   local:up:
-    desc: Start LocalStack in Docker and wait until it is healthy (needs LOCALSTACK_AUTH_TOKEN)
+    desc: Start Floci in Docker and wait until it is healthy
     preconditions:
-      - sh: test -n "$LOCALSTACK_AUTH_TOKEN"
-        msg: "LOCALSTACK_AUTH_TOKEN is not set - export it or put it in .env. LocalStack needs one even on its free tier: https://app.localstack.cloud"
-      - sh: test -z "$(docker ps -aq --filter name=^localstack-main$)"
-        msg: "a localstack-main container already exists - run `task local:down` first"
+      - sh: test -z "$(docker ps -aq --filter name=^floci-main$)"
+        msg: "a floci-main container already exists - run `task local:down` first"
     cmds:
+      # Floci runs functions on the host's native architecture, so arm64 functions work on x86 too.
       - >-
-        docker run -d --name localstack-main -p 4566:4566
-        -e LAMBDA_IGNORE_ARCHITECTURE=1 -e LOCALSTACK_AUTH_TOKEN
+        docker run -d --name floci-main -p 4566:4566
+        -e FLOCI_DEFAULT_REGION={{.REGION}}
         -v /var/run/docker.sock:/var/run/docker.sock {{.LOCAL_IMAGE}}
       - |
         echo "waiting for {{.LOCAL_ENDPOINT}} ..."
         for i in $(seq 1 60); do
-          curl -sf {{.LOCAL_ENDPOINT}}/_localstack/health >/dev/null && { echo "LocalStack is up"; exit 0; }
+          curl -sf {{.LOCAL_ENDPOINT}}/_floci/health >/dev/null && { echo "Floci is up"; exit 0; }
           sleep 2
         done
-        echo "LocalStack did not come up in time"; docker logs localstack-main | tail -20; exit 1
+        echo "Floci did not come up in time"; docker logs floci-main | tail -20; exit 1
 
   local:down:
-    desc: Stop and remove LocalStack (deletes everything in it)
+    desc: Stop and remove Floci (deletes everything in it)
     cmds:
-      # Stop gracefully first so LocalStack removes the Lambda containers it started.
-      - docker stop localstack-main
-      - docker rm -f localstack-main
-      - docker ps -aq --filter name=localstack-main-lambda | xargs docker rm -f 2>/dev/null || true
+      # Stop gracefully first so Floci removes the Lambda containers it started; sweep any
+      # it left behind (they are named floci-<stack>-<function>-<id>).
+      - docker stop floci-main
+      - docker rm -f floci-main
+      - docker ps -aq --filter name=^floci-{{.STACK}}- | xargs docker rm -f 2>/dev/null || true
 
   local:deploy:
-    desc: Build and deploy the stack into LocalStack
+    desc: Build and deploy the stack into Floci
     env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test, AWS_DEFAULT_REGION: "{{.REGION}}" }
     cmds:
       # SAM looks for samconfig.toml next to the template, so name it when building elsewhere.
       - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
       - samlocal deploy --config-env local --config-file {{.ROOT_DIR}}/samconfig.toml --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
+      # Floci gap (2.1.0): its CloudFormation drops MaximumBatchingWindowInSeconds and
+      # FunctionResponseTypes from AWS::Lambda::EventSourceMapping. Re-apply them through the
+      # Lambda API so the archiver batches like it does on AWS. The response types are sent
+      # too, but Floci currently ignores them - see the README's Floci notes.
+      - |
+        UUID=$({{.LOCAL_CLI}} lambda list-event-source-mappings --region {{.REGION}} \
+                 --query "EventSourceMappings[?contains(FunctionArn, 'ArchiverFunction')].UUID" --output text)
+        {{.LOCAL_CLI}} lambda update-event-source-mapping --uuid "$UUID" --region {{.REGION}} \
+            --maximum-batching-window-in-seconds 30 --function-response-types ReportBatchItemFailures \
+            --query '{BatchSize:BatchSize,Window:MaximumBatchingWindowInSeconds,ResponseTypes:FunctionResponseTypes}' --output text
 
   local:generate:
-    desc: Post fake events to the LocalStack webhook
+    desc: Post fake events to the Floci webhook
     vars:
       # Function URLs are routed by hostname. Posting to localhost with the URL's host in
-      # the Host header works even where *.localhost.localstack.cloud does not resolve.
+      # the Host header works even where the emulator's wildcard DNS does not resolve.
       HOST:
         sh: task local:url | sed -E 's#^https?://([^/:]+).*#\1#'
     cmds:
@@ -266,75 +276,75 @@ tasks:
         WEBHOOK_URL={{.LOCAL_ENDPOINT}}/ WEBHOOK_HOST={{.HOST}} WEBHOOK_SECRET={{.LOCAL_SECRET}}
         {{.PY}} generator/generate.py --interval 1 --batch-size 3 --count 10
 
-  # --- look inside LocalStack: the same helpers, pointed at the local endpoint
+  # --- look inside Floci: the same helpers, pointed at the local endpoint
   local:health:
-    desc: Which LocalStack services are up
+    desc: Floci health
     cmds:
-      - curl -sf {{.LOCAL_ENDPOINT}}/_localstack/health | {{.PY}} -m json.tool
+      - curl -sf {{.LOCAL_ENDPOINT}}/_floci/health | {{.PY}} -m json.tool
 
   local:outputs:
-    desc: Stack outputs in LocalStack
+    desc: Stack outputs in Floci
     cmds: [{ task: _outputs, vars: { CLI: "{{.LOCAL_CLI}}" } }]
 
   local:resources:
-    desc: Every resource in the LocalStack stack, with type and status
+    desc: Every resource in the Floci stack, with type and status
     cmds: [{ task: _resources, vars: { CLI: "{{.LOCAL_CLI}}" } }]
 
   local:url:
     silent: true
-    desc: Print the LocalStack webhook URL
+    desc: Print the Floci webhook URL
     cmds: [{ task: _output, vars: { CLI: "{{.LOCAL_CLI}}", KEY: WebhookUrl } }]
 
   local:logs:
-    desc: Tail the webhook Lambda logs in LocalStack (FOLLOW= to print and exit)
+    desc: Tail the webhook Lambda logs in Floci (FOLLOW= to print and exit)
     cmds: [{ task: _lambda-logs, vars: { CLI: "{{.LOCAL_CLI}}", FUNCTION: WebhookFunction } }]
 
   local:logs:archiver:
-    desc: Tail the archiver Lambda logs in LocalStack (FOLLOW= to print and exit)
+    desc: Tail the archiver Lambda logs in Floci (FOLLOW= to print and exit)
     cmds: [{ task: _lambda-logs, vars: { CLI: "{{.LOCAL_CLI}}", FUNCTION: ArchiverFunction } }]
 
   local:logs:events:
-    desc: Tail every event on the LocalStack bus (FOLLOW= to print and exit)
+    desc: Tail every event on the Floci bus (FOLLOW= to print and exit)
     cmds: [{ task: _log-tail, vars: { CLI: "{{.LOCAL_CLI}}", GROUP: "/aws/events/{{.BUS_NAME}}" } }]
 
   local:queues:
-    desc: Depth of the LocalStack archive queue and its dead-letter queue
+    desc: Depth of the Floci archive queue and its dead-letter queue
     cmds: [{ task: _queues, vars: { CLI: "{{.LOCAL_CLI}}" } }]
 
   local:errors:
-    desc: LocalStack dead-letter queue depth (should be 0)
+    desc: Floci dead-letter queue depth (should be 0)
     cmds: [{ task: _errors, vars: { CLI: "{{.LOCAL_CLI}}" } }]
 
   local:archive:
-    desc: List the archive files in LocalStack S3, with a total
+    desc: List the archive files in Floci S3, with a total
     cmds: [{ task: _archive, vars: { CLI: "{{.LOCAL_CLI}}", BUCKET: "{{.LOCAL_BUCKET}}" } }]
 
   local:duckdb:
-    desc: Open the DuckDB prompt over the LocalStack archive, views loaded
+    desc: Open the DuckDB prompt over the Floci archive, views loaded
     cmds:
       - task: _duckdb
         vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
 
   local:harlequin:
-    desc: Open Harlequin over the LocalStack archive, views loaded
+    desc: Open Harlequin over the Floci archive, views loaded
     cmds:
       - task: _harlequin
         vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
 
   local:query:
-    desc: Run a SQL file over the LocalStack archive (QUERY_FILE=queries/examples.sql)
+    desc: Run a SQL file over the Floci archive (QUERY_FILE=queries/examples.sql)
     cmds:
       - task: _query
         vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
 
   local:verify:
-    desc: Assert the LocalStack archive holds EXPECT events (default 30)
+    desc: Assert the Floci archive holds EXPECT events (default 30)
     cmds:
       - task: _verify
         vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
 
   local:e2e:
-    desc: The whole pipeline in LocalStack - up, deploy, generate, verify; what CI runs
+    desc: The whole pipeline in Floci - up, deploy, generate, verify; what CI runs
     cmds:
       - task: local:up
       - defer: { task: local:down }

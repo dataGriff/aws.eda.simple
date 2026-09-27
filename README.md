@@ -22,13 +22,13 @@ flowchart LR
     Q -. "3 failed receives" .-> X[SQS<br/>dead-letter queue]
 ```
 
-Everything is deployed with **AWS SAM** from a single `template.yaml`, with no prerequisites beyond AWS credentials - or into **LocalStack** with no AWS account at all. Both Lambdas have **no third-party dependencies** (boto3 ships with the runtime).
+Everything is deployed with **AWS SAM** from a single `template.yaml`, with no prerequisites beyond AWS credentials - or into **Floci**, a free local AWS emulator, with no AWS account at all. Both Lambdas have **no third-party dependencies** (boto3 ships with the runtime).
 
 ## Project layout
 
 ```
 template.yaml               SAM template: bus, Lambdas, IAM, rule, log groups, bucket, queues
-samconfig.toml              SAM CLI defaults; [local] env targets LocalStack
+samconfig.toml              SAM CLI defaults; [local] env targets Floci
 mise.toml                   Every tool, pinned: python, task, duckdb, awscli, sam, samlocal
 Taskfile.yml                Every command: `task --list`. CI calls the same tasks you do
 src/webhook/app.py          Webhook handler and pure helper functions
@@ -79,7 +79,7 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 
 - [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, Harlequin, the AWS CLI, SAM and `samlocal`
 - To deploy to AWS: an AWS account and credentials configured for the AWS CLI
-- To run it locally instead: Docker and a free [LocalStack](https://app.localstack.cloud) auth token
+- To run it locally instead: Docker. [Floci](https://floci.io) needs no account and no token
 
 No account-level setup is needed for AWS. `task deploy` is the whole story.
 
@@ -96,18 +96,17 @@ Every command below is a `task`; CI runs the very same tasks, so if it works for
 
 ## Run the whole thing locally
 
-The pipeline runs unchanged in [LocalStack](https://localstack.cloud): same template, same Lambdas, same
+The pipeline runs unchanged in [Floci](https://floci.io), a free open-source AWS emulator: same template, same Lambdas, same
 generator, same DuckDB queries. No AWS account, no secret to generate.
 
 ```bash
-echo "LOCALSTACK_AUTH_TOKEN=..." >> .env   # free tier is fine; see below. Or export it.
-task local:e2e          # up, deploy, generate, wait, verify - then tears LocalStack down
+task local:e2e          # up, deploy, generate, wait, verify - then tears Floci down
 ```
 
-or step by step, leaving LocalStack up to poke at:
+or step by step, leaving Floci up to poke at:
 
 ```bash
-task local:up           # docker run localstack/localstack, waits for healthy
+task local:up           # docker run floci/floci, healthy in a few seconds
 task local:deploy       # samlocal build + deploy (samconfig.toml [local] env)
 task local:generate     # 10 POSTs, 3 events each, at the local Function URL
 sleep 45                # the archiver batches for up to 30s
@@ -119,15 +118,30 @@ task local:down
 ```
 
 `task local:generate` posts to `localhost:4566` with the Function URL's hostname in the `Host` header, which is
-how LocalStack routes Function URLs anyway - so it works even where your resolver refuses the
-`*.localhost.localstack.cloud` wildcard (some ISPs block DNS answers that point at 127.0.0.1).
+how Function URLs are routed anyway. Floci's URLs use a `<id>.lambda-url.<region>.localhost:4566` hostname, which
+resolves without DNS on most systems, so the plain URL works too; the header route is kept because it is
+emulator-independent.
 
-`task local:up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
-free Hobby tier** (the image exits with "License activation failed" without one), so create an account at
-[app.localstack.cloud](https://app.localstack.cloud) and put `LOCALSTACK_AUTH_TOKEN=...` in `.env` (or export it) first. The
-token lives in `.env` or your shell (or a CI secret), never in git. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64`
-functions run on an x86 host. CI runs `task local:e2e` on every push, with the token as the `LOCALSTACK_AUTH_TOKEN` repository
-secret - see `.github/workflows/ci.yml`.
+`task local:up` is a plain `docker run` of `floci/floci:latest` with the Docker socket mounted (Lambda runs in
+real containers) and `FLOCI_DEFAULT_REGION` set. Floci runs functions on the host's native architecture, so the
+`arm64` functions run on an x86 CI runner without any flag. CI runs `task local:e2e` on every push with no
+secrets at all - see `.github/workflows/ci.yml`.
+
+### Floci parity notes
+
+Floci 2.1.0 runs this pipeline end to end - webhook, bus, queue, archiver, S3, DuckDB - with these gaps, each
+found by running it and visible in `docker logs floci-main` or the resource list:
+
+| Gap | Effect | What this repo does about it |
+|---|---|---|
+| SAM's `FunctionUrlConfig` is not expanded | no Function URL; the `WebhookUrl` output comes back unresolved | the template declares `AWS::Lambda::Url` + `AWS::Lambda::Permission` explicitly - exactly what SAM generates on AWS, verified by redeploying there |
+| CloudFormation drops `MaximumBatchingWindowInSeconds` and `FunctionResponseTypes` from the event source mapping | one archiver invocation per event | `task local:deploy` re-applies both through the Lambda API; the window then works (one file per 30s batch) |
+| `ReportBatchItemFailures` is ignored at runtime | a message the archiver rejects is dropped with its batch instead of retried and dead-lettered | nothing possible from here; `task local:errors` will always report 0 |
+| EventBridge → CloudWatch Logs target unsupported | `task local:logs:events` shows nothing | the archive is the record: `task local:logs:archiver` and `task local:archive` show the flow |
+
+None of these affect AWS. If you need to exercise the dead-letter path or the log-group tail locally, the
+LocalStack variant of this repo (`feat/sqs-archiver`, PR #2) does both faithfully, at the cost of an auth token
+and a much slower start.
 
 ## Deploy to AWS
 
@@ -138,8 +152,8 @@ task outputs                                    # shows WebhookUrl, bucket, queu
 ```
 
 Secrets can live in a `.env` file at the repo root instead of your shell - it is gitignored and the Taskfile
-loads it (`dotenv`). Put `WEBHOOK_SECRET=...` and `LOCALSTACK_AUTH_TOKEN=...` there once and every task sees
-them; CI has no `.env` and gets its secrets from the environment.
+loads it (`dotenv`). Put `WEBHOOK_SECRET=...` there once and every task sees it; CI has no `.env` and needs no
+secrets.
 
 `task deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with task variables, e.g. `task deploy REGION=us-east-1 BUS_NAME=my-bus`.
 For a first-time interactive deploy you can also use `task deploy:guided`.
@@ -171,10 +185,10 @@ done: 2 request(s), 6 event(s) accepted, 0 request(s) failed
 
 ## Look inside
 
-Every inspection task exists twice: plain for AWS, `local:` for LocalStack. Same command underneath,
+Every inspection task exists twice: plain for AWS, `local:` for Floci. Same command underneath,
 different endpoint.
 
-| AWS | LocalStack | Shows |
+| AWS | Floci | Shows |
 |---|---|---|
 | `task outputs` | `task local:outputs` | stack outputs: webhook URL, bucket, queue URLs |
 | `task resources` | `task local:resources` | every resource in the stack, with type and status |
@@ -186,7 +200,7 @@ different endpoint.
 | `task archive` | `task local:archive` | the archive files on S3, with a total |
 | `task duckdb` / `task query` | `task local:duckdb` / `task local:query` | query the archive at the DuckDB prompt, or run a SQL file |
 | `task harlequin` | `task local:harlequin` | query the archive in [Harlequin](https://harlequin.sh), a SQL IDE in the terminal, views preloaded |
-| - | `task local:health` | which LocalStack services are up |
+| - | `task local:health` | which Floci services are up |
 
 The `logs*` tasks follow by default; `task logs:archiver FOLLOW=` prints the last ten minutes and exits,
 which is handy in scripts.
@@ -240,7 +254,7 @@ timestamp in the name is when the batch was written.
 
 ### How DuckDB reads it
 
-`queries/views.sql` reads the archive location from a DuckDB variable, so the same file serves S3, LocalStack
+`queries/views.sql` reads the archive location from a DuckDB variable, so the same file serves S3, Floci
 and the test suite's temp directory. `task duckdb` does this for you:
 
 ```sql
@@ -305,7 +319,7 @@ alone. In Athena or Trino the unnest above becomes
 - `tests/test_archive_query.py` writes archive files with the archiver's own code and queries them through
   `queries/views.sql` with the DuckDB Python package - so the SQL is tested offline, against the real file format.
 - `task invoke:webhook` runs the webhook handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. The handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
-- `task invoke:archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. For a fully local run use the LocalStack targets above instead.
+- `task invoke:archiver` does the same for the archiver with `events/sqs.json`; set `ARCHIVE_BUCKET` in `env.json` to a bucket you can write to. For a fully local run use the Floci targets above instead.
 - `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
 
 ## Security notes
