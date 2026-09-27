@@ -13,16 +13,25 @@ from tests.helpers import SECRET
 os.environ["WEBHOOK_SECRET"] = SECRET
 os.environ["EVENT_BUS_NAME"] = "test-bus"
 os.environ["EVENT_SOURCE"] = "com.example.test"
+os.environ["ARCHIVE_BUCKET"] = "test-lake"
 os.environ.setdefault("AWS_DEFAULT_REGION", "eu-west-1")
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 
-from webhook import app  # noqa: E402  (import after env setup on purpose)
+from archiver import app as archiver  # noqa: E402  (import after env setup on purpose)
+from webhook import app  # noqa: E402
 
 
 @pytest.fixture
 def stubber():
     with Stubber(app.events_client) as stub:
+        yield stub
+        stub.assert_no_pending_responses()
+
+
+@pytest.fixture
+def s3_stubber():
+    with Stubber(archiver.s3_client) as stub:
         yield stub
         stub.assert_no_pending_responses()
 

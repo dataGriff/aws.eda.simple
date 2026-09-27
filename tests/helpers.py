@@ -88,25 +88,18 @@ def bus_envelope_from_entry(entry, *, envelope_id=ENVELOPE_ID):
     }
 
 
-def firehose_event(payloads, *, record_ids=None):
-    """Build a Firehose transform invocation event from a list of record payloads.
-
-    A payload that is not a str/bytes is JSON-encoded; pass a raw string to simulate
-    a malformed record.
-    """
+def sqs_event(bodies, *, message_ids=None):
+    """Build an SQS Lambda event. A body that is not a str is JSON-encoded."""
     records = []
-    for i, payload in enumerate(payloads):
-        if isinstance(payload, bytes):
-            raw = payload
-        elif isinstance(payload, str):
-            raw = payload.encode()
-        else:
-            raw = json.dumps(payload).encode()
-        record_id = record_ids[i] if record_ids else f"rec-{i}"
-        records.append({"recordId": record_id, "data": base64.b64encode(raw).decode()})
-    return {"invocationId": "test-invocation", "records": records}
-
-
-def decode_row(record):
-    """Decode a transformed Firehose record back into a row dict."""
-    return json.loads(base64.b64decode(record["data"]).decode())
+    for i, body in enumerate(bodies):
+        records.append(
+            {
+                "messageId": message_ids[i] if message_ids else f"msg-{i}",
+                "receiptHandle": f"rh-{i}",
+                "body": body if isinstance(body, str) else json.dumps(body),
+                "attributes": {"ApproximateReceiveCount": "1"},
+                "eventSource": "aws:sqs",
+                "awsRegion": "eu-west-1",
+            }
+        )
+    return {"Records": records}

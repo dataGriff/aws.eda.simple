@@ -1,2 +1,0 @@
-# Intentionally empty: this function uses only the standard library.
-# It calls no AWS APIs, so it does not even need the runtime's bundled boto3.

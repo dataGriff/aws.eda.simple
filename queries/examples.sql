@@ -7,9 +7,11 @@ FROM   events
 GROUP  BY 1
 ORDER  BY 2 DESC;
 
--- How long events take to land: Firehose buffers for 60s, so expect roughly that.
-SELECT round(avg(epoch(ingest_time) - epoch(event_time)), 1) AS avg_lag_seconds,
-       max(epoch(ingest_time) - epoch(event_time))           AS worst_lag_seconds
+-- How long events take to land. The archiver batches for up to 30s, so expect roughly that.
+-- archived_at is parsed from the file name; event_time is the envelope's own timestamp.
+SELECT round(avg(epoch(archived_at) - epoch(event_time)), 1) AS avg_lag_seconds,
+       max(epoch(archived_at) - epoch(event_time))           AS worst_lag_seconds,
+       count(DISTINCT dt)                                    AS days_archived
 FROM   events;
 
 -- Individual line items, newest first.

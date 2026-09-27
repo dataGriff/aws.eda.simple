@@ -5,7 +5,11 @@ botocore>=1.34
 pytest>=8
 ruff>=0.6
 Faker>=26
+duckdb>=1.1
 
 # SAM CLI is needed for build/deploy. Uncomment to install via pip, or install
 # it with brew / pipx instead: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
 # aws-sam-cli>=1.120
+# Local run (make local-*): samlocal points SAM at LocalStack, localstack is its CLI.
+# aws-sam-cli-local>=1.0
+# localstack>=4

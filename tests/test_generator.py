@@ -79,3 +79,42 @@ def test_main_requires_url_and_secret(capsys, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         generate.main(["--dry-run"])
     assert exc.value.code == 2
+
+
+def test_post_overrides_host_header_when_asked(monkeypatch):
+    seen = {}
+
+    class FakeResponse:
+        status = 202
+
+        def read(self):
+            return b'{"accepted": 1, "failed": 0, "failures": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout):
+        seen["host"] = req.get_header("Host")
+        seen["url"] = req.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(generate.urllib.request, "urlopen", fake_urlopen)
+
+    status, _ = generate.post(
+        "http://localhost:4566/", "s", {"id": "x"}, host="abc.lambda-url.test"
+    )
+    assert status == 202
+    assert seen == {"host": "abc.lambda-url.test", "url": "http://localhost:4566/"}
+
+    generate.post("http://localhost:4566/", "s", {"id": "x"})
+    assert seen["host"] is None
+
+
+def test_parse_args_accepts_host(monkeypatch):
+    monkeypatch.delenv("WEBHOOK_HOST", raising=False)
+    args = generate.parse_args(["--url", "u", "--secret", "s", "--host", "h.example"])
+    assert args.host == "h.example"
+    assert generate.parse_args(["--url", "u", "--secret", "s"]).host is None
