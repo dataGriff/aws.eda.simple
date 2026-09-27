@@ -238,8 +238,9 @@ tasks:
     desc: Build and deploy the stack into LocalStack
     env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test, AWS_DEFAULT_REGION: "{{.REGION}}" }
     cmds:
+      # SAM looks for samconfig.toml next to the template, so name it when building elsewhere.
       - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
-      - samlocal deploy --config-env local --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
+      - samlocal deploy --config-env local --config-file {{.ROOT_DIR}}/samconfig.toml --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
 
   local:url:
     silent: true
