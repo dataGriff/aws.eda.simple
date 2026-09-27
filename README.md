@@ -77,7 +77,7 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 
 ## Prerequisites
 
-- [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, the AWS CLI, SAM and `samlocal`
+- [mise](https://mise.jdx.dev) - it installs everything else from `mise.toml`: Python 3.12, `task`, `duckdb`, Harlequin, the AWS CLI, SAM and `samlocal`
 - To deploy to AWS: an AWS account and credentials configured for the AWS CLI
 - To run it locally instead: Docker and a free [LocalStack](https://app.localstack.cloud) auth token
 
@@ -114,6 +114,7 @@ sleep 45                # the archiver batches for up to 30s
 task local:verify       # DuckDB counts the archived events: expects 30
 task local:query        # runs queries/examples.sql over the local archive
 task local:duckdb       # or interactively
+task local:resources    # and everything under "Look inside" below has a local: twin
 task local:down
 ```
 
@@ -168,14 +169,27 @@ Example output:
 done: 2 request(s), 6 event(s) accepted, 0 request(s) failed
 ```
 
-## Watch the events flow
+## Look inside
 
-```bash
-task logs:events        # tails /aws/events/simple-eda-bus: one line per event on the bus
-task logs               # tails the webhook's own logs (accepted/failed counts per request)
-task logs:archiver      # tails the archiver: one line per batch written, with the S3 key
-task errors             # dead-letter queue depth - "no delivery errors" is what you want
-```
+Every inspection task exists twice: plain for AWS, `local:` for LocalStack. Same command underneath,
+different endpoint.
+
+| AWS | LocalStack | Shows |
+|---|---|---|
+| `task outputs` | `task local:outputs` | stack outputs: webhook URL, bucket, queue URLs |
+| `task resources` | `task local:resources` | every resource in the stack, with type and status |
+| `task logs` | `task local:logs` | the webhook Lambda's logs (accepted/failed per request) |
+| `task logs:events` | `task local:logs:events` | one line per event on the bus, via the catch-all rule |
+| `task logs:archiver` | `task local:logs:archiver` | one line per batch the archiver wrote, with the S3 key |
+| `task queues` | `task local:queues` | visible and in-flight depth of the archive queue and its DLQ |
+| `task errors` | `task local:errors` | dead-letter depth - "no delivery errors" is what you want |
+| `task archive` | `task local:archive` | the archive files on S3, with a total |
+| `task duckdb` / `task query` | `task local:duckdb` / `task local:query` | query the archive at the DuckDB prompt, or run a SQL file |
+| `task harlequin` | `task local:harlequin` | query the archive in [Harlequin](https://harlequin.sh), a SQL IDE in the terminal, views preloaded |
+| - | `task local:health` | which LocalStack services are up |
+
+The `logs*` tasks follow by default; `task logs:archiver FOLLOW=` prints the last ten minutes and exits,
+which is handy in scripts.
 
 A delivered event looks like this in the events log group, and identically in the archive:
 
@@ -203,6 +217,7 @@ The archiver batches for up to 30 seconds, so give it a minute after `task gener
 ```bash
 task errors             # should report none
 task duckdb             # opens the DuckDB prompt with the views from queries/views.sql loaded
+task harlequin          # the same, in Harlequin - a SQL IDE in the terminal with a results grid
 task query              # runs queries/examples.sql and prints the results
 task query QUERY_FILE=queries/views.sql     # or any other file
 ```

@@ -93,7 +93,7 @@ generator → Function URL → webhook Lambda → EventBridge bus ─┬─→ C
 3. `src/archiver/app.py`: `parse_messages` (a body that is a JSON object becomes one compact line; anything else is a failure by `messageId`), `object_key` (`events/dt=…/<timestamp>Z-<batch>.jsonl.gz`, UTC, no colons), `pack` (gzip, trailing newline), `write_archive` (`put_object`, **no** `ContentEncoding` header), and a handler returning `{"batchItemFailures": [...]}`.
 4. In the template: `Events: Archive: Type: SQS` with `BatchSize: 100`, `MaximumBatchingWindowInSeconds: 30`, `FunctionResponseTypes: [ReportBatchItemFailures]`; an inline policy for `s3:PutObject` on `events/*` only.
 5. Tests: N good bodies → one `put_object` whose gzip body round-trips to N lines; a bad body → its id in `batchItemFailures` and the good ones still written; empty batch → no call; key format; S3 `ClientError` propagates.
-6. Tasks: `logs:archiver`, `errors` (dead-letter queue depth), `bucket`, `empty-bucket`.
+6. Tasks: `logs:archiver`, `queues`, `errors` (dead-letter queue depth), `archive`, `bucket`, `empty-bucket`. Write each inspection command once as an internal task taking a `CLI` variable (`aws` or `aws --endpoint-url …` with dummy credentials), and add thin public wrappers - the `local:` twins in task 7 then cost one line each.
 
 **Check:** `task ci` green.
 
@@ -109,7 +109,7 @@ generator → Function URL → webhook Lambda → EventBridge bus ─┬─→ C
 
 1. `queries/views.sql`. The `events` view reads `read_json(getvariable('archive'), format='newline_delimited', hive_partitioning=true, filename=true, columns={...})` with explicit column types - `detail` as `JSON` - and `QUALIFY row_number() OVER (PARTITION BY id ORDER BY filename) = 1` to collapse duplicate deliveries. Then `orders`, `payments` (plain `json_extract_string`) and `order_items` (the `items` array unnested via `from_json(..., '["STRUCT(sku VARCHAR, qty INTEGER, unit_price DOUBLE)"]')`).
 2. `queries/examples.sql`: a handful of worked queries, including a reconciliation of item totals against each order's own total.
-3. Tasks: internal `_duckdb`, `_query`, `_verify` taking `SECRET_SQL` and `ARCHIVE` vars; public `duckdb`, `query` on top. The caller runs `SET VARIABLE archive = 's3://…/events/**/*.jsonl.gz'` then `.read queries/views.sql`.
+3. Tasks: internal `_duckdb`, `_query`, `_verify`, `_harlequin` taking `SECRET_SQL` and `ARCHIVE` vars; public `duckdb`, `query`, `harlequin` on top. The caller runs `SET VARIABLE archive = 's3://…/events/**/*.jsonl.gz'` then `.read queries/views.sql`. Harlequin has no `.read`, so its task writes the boot SQL and `views.sql` into one init script and starts Harlequin with `--init-path` - same views, nicer interface.
 4. `tests/test_archive_query.py`: write `.jsonl.gz` files into `tmp_path` with the archiver's own `pack()`, point the `archive` variable at them with the `duckdb` Python package, execute `views.sql`, and assert the mapping, the dedupe, the unnest, the cross-type join, and that an unknown payload field breaks nothing.
 
 **Check:** `task test` runs the read-side tests with no AWS and no Docker.
@@ -158,7 +158,7 @@ generator → Function URL → webhook Lambda → EventBridge bus ─┬─→ C
 
 - Pipeline lag: `task query` → the lag query compares `archived_at` (from the file name) with `event_time`. Expect roughly the batching window.
 - Something rejected: `task errors` shows the dead-letter depth; `task logs:archiver` shows `message_rejected` with the message id. Read the message from the DLQ, fix the producer, redrive.
-- Nothing arriving: check the rule's `FailedInvocations` metric first - it is the silent-failure signal for both targets.
+- Nothing arriving: `task resources` to see that everything is `CREATE_COMPLETE`, `task queues` to see whether events are reaching SQS at all, then the rule's `FailedInvocations` metric - it is the silent-failure signal for both targets. Every one of these has a `local:` twin.
 - Tear down: `task empty-bucket` (deliberately separate - it deletes the archive), then `task delete`. `task local:down` for LocalStack.
 
 ---

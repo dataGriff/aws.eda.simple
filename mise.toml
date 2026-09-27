@@ -7,3 +7,4 @@ duckdb = "latest"
 awscli = "latest"
 aws-sam-cli = "latest"
 "pypi:aws-sam-cli-local" = "latest"   # samlocal: points SAM at LocalStack
+"pypi:harlequin" = "latest"           # SQL IDE in the terminal, DuckDB adapter built in
