@@ -100,7 +100,7 @@ The pipeline runs unchanged in [LocalStack](https://localstack.cloud): same temp
 generator, same DuckDB queries. No AWS account, no secret to generate.
 
 ```bash
-export LOCALSTACK_AUTH_TOKEN=...   # free tier is fine; see below
+echo "LOCALSTACK_AUTH_TOKEN=..." >> .env   # free tier is fine; see below. Or export it.
 task local:e2e          # up, deploy, generate, wait, verify - then tears LocalStack down
 ```
 
@@ -123,8 +123,8 @@ how LocalStack routes Function URLs anyway - so it works even where your resolve
 
 `task local:up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
 free Hobby tier** (the image exits with "License activation failed" without one), so create an account at
-[app.localstack.cloud](https://app.localstack.cloud) and `export LOCALSTACK_AUTH_TOKEN=...` first. The token lives in
-your shell (or a CI secret), never in the repo. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64`
+[app.localstack.cloud](https://app.localstack.cloud) and put `LOCALSTACK_AUTH_TOKEN=...` in `.env` (or export it) first. The
+token lives in `.env` or your shell (or a CI secret), never in git. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64`
 functions run on an x86 host. CI runs `task local:e2e` on every push, with the token as the `LOCALSTACK_AUTH_TOKEN` repository
 secret - see `.github/workflows/ci.yml`.
 
@@ -135,6 +135,10 @@ export WEBHOOK_SECRET=$(openssl rand -hex 24)   # keep this, the generator needs
 task deploy                                     # sam build + sam deploy
 task outputs                                    # shows WebhookUrl, bucket, queue URLs
 ```
+
+Secrets can live in a `.env` file at the repo root instead of your shell - it is gitignored and the Taskfile
+loads it (`dotenv`). Put `WEBHOOK_SECRET=...` and `LOCALSTACK_AUTH_TOKEN=...` there once and every task sees
+them; CI has no `.env` and gets its secrets from the environment.
 
 `task deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with task variables, e.g. `task deploy REGION=us-east-1 BUS_NAME=my-bus`.
 For a first-time interactive deploy you can also use `task deploy:guided`.

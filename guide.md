@@ -24,6 +24,7 @@ generator → Function URL → webhook Lambda → EventBridge bus ─┬─→ C
 2. `Taskfile.yml` with `install` (venv + `pip install -r requirements-dev.txt`), `lint` (ruff check + format check), `fmt`, `test` (pytest), `validate` (`sam validate --lint`) and `ci` that calls the first three checks.
 3. `requirements-dev.txt`: `boto3`, `botocore`, `pytest`, `ruff`, `Faker`, `duckdb`. `pyproject.toml`: ruff at 100 columns with `E F I B UP S SIM`, pytest `pythonpath = ["src", "."]`.
 4. `.github/workflows/ci.yml`: checkout, `jdx/mise-action`, `task install`, `task ci`. That is the whole job.
+5. `dotenv: [".env"]` at the top of the Taskfile, `.env` in `.gitignore`: secrets live there locally and come from the environment in CI. Commands, preconditions and called tasks all see them. One thing does *not* carry across: a task's `env:` block applies to its own commands only, not to tasks it calls - pass values to helpers explicitly.
 
 **Check:** `task ci` passes with zero tests. Push; CI is green.
 
@@ -129,7 +130,7 @@ generator → Function URL → webhook Lambda → EventBridge bus ─┬─→ C
 4. DuckDB against LocalStack: `CREATE SECRET (TYPE s3, KEY_ID 'test', SECRET 'test', REGION '…', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path')`.
 5. CI: a second job with the `LOCALSTACK_AUTH_TOKEN` repository secret, `task install`, `task local:e2e`.
 
-**Check:** `export LOCALSTACK_AUTH_TOKEN=…; task local:e2e` ends with `events archived: 30 (expected 30)`. Push; both CI jobs green. Then send a `not json` message to the queue by hand and watch it reach the dead-letter queue after three visibility timeouts while good events keep flowing.
+**Check:** put `LOCALSTACK_AUTH_TOKEN=…` in a gitignored `.env` (the Taskfile's `dotenv:` loads it) and `task local:e2e` ends with `events archived: 30 (expected 30)`. Push; both CI jobs green. Then send a `not json` message to the queue by hand and watch it reach the dead-letter queue after three visibility timeouts while good events keep flowing.
 
 > **Why LocalStack works here at all:** SQS, Lambda, S3, EventBridge and Logs are all emulated with high fidelity, including SQS batching and partial-batch responses. The earlier Firehose-to-Iceberg version of this pipeline could not run locally - Firehose has no Iceberg destination in LocalStack and Glue is a control-plane mock - which is a large part of why this design exists. **Gotcha:** LocalStack's image exits with "License activation failed" without an auth token, even on the free tier; make `local:up` fail fast with a clear message. **Gotcha:** the functions are `arm64`; `LAMBDA_IGNORE_ARCHITECTURE=1` lets an x86 runner execute them.
 

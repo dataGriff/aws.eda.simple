@@ -3,6 +3,10 @@
 # whole pipeline in LocalStack.
 version: "3"
 
+# Local secrets live in .env (gitignored): LOCALSTACK_AUTH_TOKEN, WEBHOOK_SECRET.
+# Missing file is fine - CI has none and gets its secrets from the environment.
+dotenv: [".env"]
+
 vars:
   STACK: aws-eda-simple
   REGION: eu-west-1
@@ -16,8 +20,13 @@ vars:
   # LocalStack. The webhook secret here is deliberately not secret: it only ever guards
   # a webhook on localhost.
   LOCAL_ENDPOINT: http://localhost:4566
+  # Dummy credentials LocalStack accepts. Passed to helper tasks explicitly: a task's
+  # env: block applies to its own commands, not to tasks it calls.
+  LOCAL_AWS_ENV: "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION={{.REGION}}"
   LOCAL_IMAGE: localstack/localstack
   LOCAL_SECRET: local-dev-secret-0123456789
+  # Separate build dir so a local build never overwrites an AWS one (or vice versa).
+  LOCAL_BUILD_DIR: .aws-sam/local
   LOCAL_ARCHIVE: "s3://{{.STACK}}-lake-000000000000-{{.REGION}}/events/**/*.jsonl.gz"
   EXPECT: 30
   # DuckDB session set-up. One place, so the AWS and LocalStack query tasks cannot drift.
@@ -79,7 +88,7 @@ tasks:
     deps: [build]
     preconditions:
       - sh: test -n "$WEBHOOK_SECRET"
-        msg: 'WEBHOOK_SECRET is not set. Try: export WEBHOOK_SECRET=$(openssl rand -hex 24)'
+        msg: "WEBHOOK_SECRET is not set - export it or put it in .env; generate one with: openssl rand -hex 24"
     cmds:
       - >-
         sam deploy --stack-name {{.STACK}} --region {{.REGION}}
@@ -97,25 +106,34 @@ tasks:
       - aws cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}} --query 'Stacks[0].Outputs' --output table
 
   url:
+    silent: true
     desc: Print the webhook URL
     cmds:
       - task: _output
         vars: { KEY: WebhookUrl, ENDPOINT_ARGS: "" }
 
   bucket:
+    silent: true
     desc: Print the lake bucket name
     cmds:
       - task: _output
         vars: { KEY: LakeBucketName, ENDPOINT_ARGS: "" }
 
+  dlq:
+    silent: true
+    desc: Print the dead-letter queue URL
+    cmds:
+      - task: _output
+        vars: { KEY: DeadLetterQueueUrl, ENDPOINT_ARGS: "" }
+
   generate:
     desc: Post fake events to the deployed webhook (requires WEBHOOK_SECRET)
-    preconditions:
-      - sh: test -n "$WEBHOOK_SECRET"
-        msg: WEBHOOK_SECRET is not set
     vars:
       URL:
         sh: task url
+    preconditions:
+      - sh: test -n "$WEBHOOK_SECRET"
+        msg: WEBHOOK_SECRET is not set - export it or put it in .env
     cmds:
       - WEBHOOK_URL={{.URL}} {{.PY}} generator/generate.py --interval 2 --batch-size 3 --count 10
 
@@ -138,7 +156,7 @@ tasks:
     desc: Dead-letter queue depth - how many messages the archiver rejected (should be 0)
     vars:
       DLQ:
-        sh: task _output KEY=DeadLetterQueueUrl ENDPOINT_ARGS=""
+        sh: task dlq
     cmds:
       - |
         N=$(aws sqs get-queue-attributes --queue-url "{{.DLQ}}" --region {{.REGION}} \
@@ -194,7 +212,7 @@ tasks:
     desc: Start LocalStack in Docker and wait until it is healthy (needs LOCALSTACK_AUTH_TOKEN)
     preconditions:
       - sh: test -n "$LOCALSTACK_AUTH_TOKEN"
-        msg: "LOCALSTACK_AUTH_TOKEN is not set. LocalStack needs one even on its free tier: https://app.localstack.cloud"
+        msg: "LOCALSTACK_AUTH_TOKEN is not set - export it or put it in .env. LocalStack needs one even on its free tier: https://app.localstack.cloud"
     cmds:
       - >-
         docker run -d --name localstack-main -p 4566:4566
@@ -211,25 +229,27 @@ tasks:
   local:down:
     desc: Stop and remove LocalStack (deletes everything in it)
     cmds:
+      # Stop gracefully first so LocalStack removes the Lambda containers it started.
+      - docker stop localstack-main
       - docker rm -f localstack-main
+      - docker ps -aq --filter name=localstack-main-lambda | xargs docker rm -f 2>/dev/null || true
 
   local:deploy:
     desc: Build and deploy the stack into LocalStack
     env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test, AWS_DEFAULT_REGION: "{{.REGION}}" }
     cmds:
-      - samlocal build
-      - samlocal deploy --config-env local
+      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
+      - samlocal deploy --config-env local --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
 
   local:url:
+    silent: true
     desc: Print the LocalStack webhook URL
-    env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test }
     cmds:
       - task: _output
-        vars: { KEY: WebhookUrl, ENDPOINT_ARGS: "--endpoint-url {{.LOCAL_ENDPOINT}}" }
+        vars: { KEY: WebhookUrl, ENDPOINT_ARGS: "--endpoint-url {{.LOCAL_ENDPOINT}}", ENV_PREFIX: "{{.LOCAL_AWS_ENV}}" }
 
   local:generate:
     desc: Post fake events to the LocalStack webhook
-    env: { AWS_ACCESS_KEY_ID: test, AWS_SECRET_ACCESS_KEY: test }
     vars:
       # Function URLs are routed by hostname. Posting to localhost with the URL's host in
       # the Host header works even where *.localhost.localstack.cloud does not resolve.
@@ -272,10 +292,11 @@ tasks:
   # ------------------------------------------------------------------ internal
   _output:
     internal: true
+    silent: true
     requires: { vars: [KEY] }
     cmds:
       - >-
-        aws {{.ENDPOINT_ARGS}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}}
+        {{.ENV_PREFIX}} aws {{.ENDPOINT_ARGS}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}}
         --query "Stacks[0].Outputs[?OutputKey=='{{.KEY}}'].OutputValue" --output text
 
   _duckdb:
