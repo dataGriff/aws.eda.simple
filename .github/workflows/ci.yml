@@ -40,8 +40,9 @@ jobs:
       - run: task install
       - run: task local:e2e
 
-      - name: Emulator logs and containers (on failure)
+      - name: Emulator, archiver logs and containers (on failure)
         if: failure()
         run: |
           docker ps -a
+          docker logs floci-archiver 2>&1 | tail -40 || true
           docker logs floci-main 2>&1 | tail -80 || true

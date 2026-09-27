@@ -1,6 +1,7 @@
 # Single entry point for developers, AI agents and CI. Tools come from mise.toml.
 # `task --list` shows everything; `task ci` is what CI runs; `task local:e2e` is the
-# whole pipeline in Floci, a local AWS emulator. Every AWS task has a `local:` twin that talks to it.
+# whole pipeline in Floci, a local AWS emulator, with the archiver container beside it.
+# Every AWS task has a `local:` twin that talks to it.
 version: "3"
 
 # Local secrets live in .env (gitignored), e.g. WEBHOOK_SECRET. Missing file is fine -
@@ -27,15 +28,20 @@ vars:
   LOCAL_AWS_ENV: "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION={{.REGION}}"
   LOCAL_IMAGE: floci/floci:latest
   LOCAL_SECRET: local-dev-secret-0123456789
-  # Separate build dir so a local build never overwrites an AWS one (or vice versa). The
-  # cache dir is separate too: the archiver's build artifact is a native binary, and SAM's
-  # cache key is the source hash, which does not know which architecture it was built for.
+  # Separate build dir so a local build never overwrites an AWS one (or vice versa).
   LOCAL_BUILD_DIR: .aws-sam/local
-  LOCAL_CACHE_DIR: .aws-sam/local-cache
-  # Floci runs functions on the host's architecture, so the archiver's Bento binary must be
-  # fetched for the host, not for AWS's arm64 (src/archiver/Makefile reads BENTO_ARCH).
+  # The archiver container next to Floci. Same image as Fargate, built for the host's
+  # architecture; the queue and bucket come from the Floci stack, the endpoint is Floci's.
+  LOCAL_ARCHIVER: floci-archiver
   HOST_ARCH:
     sh: uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/'
+  # The archiver image. Built from src/archiver/ (Bento's official image plus archiver.yaml),
+  # pushed to an ECR repository the deploy creates on first use. The tag is a hash of the
+  # image's inputs: an unchanged archiver deploys as the same tag and ECS leaves it alone;
+  # a changed one is a new task definition and a rolling replacement.
+  ECR_REPO: "{{.STACK}}-archiver"
+  IMAGE_TAG:
+    sh: cat src/archiver/Dockerfile src/archiver/archiver.yaml | shasum -a 256 | cut -c1-12
   LOCAL_BUCKET: "{{.STACK}}-lake-000000000000-{{.REGION}}"
   LOCAL_ARCHIVE: "s3://{{.LOCAL_BUCKET}}/events/**/*.jsonl.gz"
   EXPECT: 30
@@ -76,7 +82,7 @@ tasks:
       - "{{.PY}} -m ruff format ."
 
   test:
-    desc: Run unit tests - pytest for the webhook, generator and views, bento test for the archiver (no AWS needed)
+    desc: Run the tests - pytest (webhook, generator, views, and the archiver binary against a moto server), bento test (no AWS, no Docker)
     cmds:
       - "{{.PY}} -m pytest"
       - bento test ./src/...
@@ -94,14 +100,42 @@ tasks:
       - task: validate
 
   build:
-    desc: Build the SAM application
+    desc: Build the SAM application (the webhook; the archiver is an image, see image:build)
     cmds:
       - sam build
 
+  image:build:
+    desc: Build the archiver image (ARCH=arm64 for Fargate; the Dockerfile has no RUN, so no emulation is needed)
+    vars:
+      ARCH: '{{.ARCH | default "arm64"}}'
+    cmds:
+      - docker build --platform linux/{{.ARCH}} -t {{.ECR_REPO}}:{{.IMAGE_TAG}} src/archiver
+
   # ------------------------------------------------------------------ AWS
+  image:push:
+    desc: Push the archiver image to ECR (creates the repository on first use) and print its URI
+    deps: [image:build]
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+      REGISTRY: "{{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com"
+    cmds:
+      - >-
+        aws ecr describe-repositories --repository-names {{.ECR_REPO}} --region {{.REGION}} >/dev/null 2>&1 ||
+        aws ecr create-repository --repository-name {{.ECR_REPO}} --region {{.REGION}}
+        --image-scanning-configuration scanOnPush=true --query repository.repositoryUri --output text
+      - aws ecr get-login-password --region {{.REGION}} | docker login --username AWS --password-stdin {{.REGISTRY}}
+      - docker tag {{.ECR_REPO}}:{{.IMAGE_TAG}} {{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}
+      - docker push --quiet {{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}
+      - echo "{{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}"
+
   deploy:
-    desc: Deploy the stack to AWS (requires WEBHOOK_SECRET in the environment)
-    deps: [build]
+    desc: Deploy the stack to AWS - image to ECR, then sam deploy (requires WEBHOOK_SECRET in the environment)
+    deps: [build, image:push]
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+      IMAGE: "{{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com/{{.ECR_REPO}}:{{.IMAGE_TAG}}"
     preconditions:
       - sh: test -n "$WEBHOOK_SECRET"
         msg: "WEBHOOK_SECRET is not set - export it or put it in .env; generate one with: openssl rand -hex 24"
@@ -109,10 +143,11 @@ tasks:
       - >-
         sam deploy --stack-name {{.STACK}} --region {{.REGION}}
         --parameter-overrides WebhookSecret=$WEBHOOK_SECRET BusName={{.BUS_NAME}} EventSource={{.EVENT_SOURCE}}
+        ArchiverImage={{.IMAGE}}
 
   deploy:guided:
-    desc: Interactive first-time deploy
-    deps: [build]
+    desc: Interactive first-time deploy (the image is pushed first; answer ArchiverImage with the URI it prints)
+    deps: [build, image:push]
     cmds:
       - sam deploy --guided --stack-name {{.STACK}} --region {{.REGION}}
 
@@ -151,8 +186,26 @@ tasks:
     cmds: [{ task: _lambda-logs, vars: { CLI: "{{.AWS_CLI}}", FUNCTION: WebhookFunction } }]
 
   logs:archiver:
-    desc: Tail the archiver Lambda logs - one line per batch written (FOLLOW= to print and exit)
-    cmds: [{ task: _lambda-logs, vars: { CLI: "{{.AWS_CLI}}", FUNCTION: ArchiverFunction } }]
+    desc: Tail the archiver container's logs - one line per batch written (FOLLOW= to print and exit)
+    cmds: [{ task: _log-tail, vars: { CLI: "{{.AWS_CLI}}", GROUP: "/ecs/{{.STACK}}-archiver" } }]
+
+  archiver:
+    desc: The archiver service - tasks desired/running/pending, the rollout state, and the last ECS event
+    silent: true
+    cmds:
+      - >-
+        aws ecs describe-services --cluster {{.STACK}}-archiver --services archiver --region {{.REGION}}
+        --query 'services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,
+        rollout:deployments[0].rolloutState,image:deployments[0].taskDefinition,lastEvent:events[0].message}'
+        --output table
+
+  archiver:scale:
+    desc: Run N archiver tasks - `task archiver:scale N=0` pauses it, events wait on the queue (a deploy resets N)
+    requires: { vars: [N] }
+    cmds:
+      - >-
+        aws ecs update-service --cluster {{.STACK}}-archiver --service archiver --region {{.REGION}}
+        --desired-count {{.N}} --query 'service.{desired:desiredCount,running:runningCount}' --output text
 
   logs:events:
     desc: Tail every event on the bus, via the catch-all rule (FOLLOW= to print and exit)
@@ -205,11 +258,6 @@ tasks:
     cmds:
       - sam local invoke WebhookFunction -e events/post.json --env-vars env.json
 
-  invoke:archiver:
-    desc: Invoke the archiver in a local container with events/sqs.json (needs env.json, writes to real S3; arm64 host or QEMU)
-    cmds:
-      - sam local invoke ArchiverFunction -e events/sqs.json --env-vars env.json
-
   empty-bucket:
     desc: Empty the lake bucket (CloudFormation cannot delete a bucket with objects)
     vars:
@@ -219,9 +267,11 @@ tasks:
       - aws s3 rm "s3://{{.BUCKET}}/" --recursive --region {{.REGION}}
 
   delete:
-    desc: Delete the AWS stack (run empty-bucket first)
+    desc: Delete the AWS stack and the archiver's ECR repository (run empty-bucket first)
     cmds:
       - sam delete --stack-name {{.STACK}} --region {{.REGION}} --no-prompts
+      # Created by image:push, not by the stack, so removed here.
+      - aws ecr delete-repository --repository-name {{.ECR_REPO}} --region {{.REGION}} --force --query repository.repositoryName --output text || true
 
   # ------------------------------------------------------------------ Floci
   # The whole pipeline on your machine: no AWS account, no WEBHOOK_SECRET, no auth token.
@@ -244,15 +294,14 @@ tasks:
           sleep 2
         done
         echo "Floci did not come up in time"; docker logs floci-main | tail -20; exit 1
-      # Pull the Lambda runtime images now rather than inside the first invocation: on a fresh
-      # machine or CI runner the Python pull is ~780 MB and would otherwise eat the first
-      # request. provided:al2023 is the archiver's (Bento, custom runtime).
+      # Pull the Lambda runtime image now rather than inside the first invocation: on a fresh
+      # machine or CI runner the pull is ~780 MB and would otherwise eat the first request.
       - docker pull -q public.ecr.aws/lambda/python:3.12
-      - docker pull -q public.ecr.aws/lambda/provided:al2023
 
   local:down:
     desc: Stop and remove Floci (deletes everything in it)
     cmds:
+      - task: local:archiver:down
       # Stop gracefully first so Floci removes the Lambda containers it started; sweep any
       # it left behind (they are named floci-<stack>-<function>-<id>).
       - docker stop floci-main
@@ -260,26 +309,56 @@ tasks:
       - docker ps -aq --filter name=^floci-{{.STACK}}- | xargs docker rm -f 2>/dev/null || true
 
   local:deploy:
-    desc: Build and deploy the stack into Floci
+    desc: Build and deploy the stack into Floci, then start the archiver container next to it
     env:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: "{{.REGION}}"
-      BENTO_ARCH: "{{.HOST_ARCH}}"
     cmds:
       # SAM looks for samconfig.toml next to the template, so name it when building elsewhere.
-      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}} --cache-dir {{.LOCAL_CACHE_DIR}}
+      # The [local] config env deploys with ArchiverDeployment=none: the bus, webhook, queue
+      # and bucket, but no ECS - the archiver is the container started below.
+      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
       - samlocal deploy --config-env local --config-file {{.ROOT_DIR}}/samconfig.toml --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
-      # Floci gap (2.1.0): its CloudFormation drops MaximumBatchingWindowInSeconds and
-      # FunctionResponseTypes from AWS::Lambda::EventSourceMapping. Re-apply them through the
-      # Lambda API so the archiver batches like it does on AWS. The response types are sent
-      # too, but Floci currently ignores them - see the README's Floci notes.
+      - task: local:archiver:up
+
+  local:archiver:up:
+    desc: Build the archiver image for this host and run it against Floci's queue and bucket
+    vars:
+      QUEUE_URL:
+        sh: task local:outputs:queue-url
+    cmds:
+      - task: image:build
+        vars: { ARCH: "{{.HOST_ARCH}}" }
+      - docker rm -f {{.LOCAL_ARCHIVER}} >/dev/null 2>&1 || true
+      # The same image and the same environment variables as the Fargate task definition,
+      # plus the three an emulator needs: an endpoint, path-style S3 and dummy credentials.
+      # host.docker.internal is the host from inside a container (Docker Desktop resolves it
+      # natively; --add-host makes Linux do the same).
+      - >-
+        docker run -d --name {{.LOCAL_ARCHIVER}} --add-host host.docker.internal:host-gateway
+        -e ARCHIVE_QUEUE_URL={{.QUEUE_URL}} -e ARCHIVE_BUCKET={{.LOCAL_BUCKET}} -e ARCHIVE_PREFIX=events/
+        -e BATCH_COUNT=100 -e BATCH_PERIOD=30s -e LOG_LEVEL=INFO
+        -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 -e S3_FORCE_PATH_STYLE=true
+        -e AWS_REGION={{.REGION}} -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
+        {{.ECR_REPO}}:{{.IMAGE_TAG}}
       - |
-        UUID=$({{.LOCAL_CLI}} lambda list-event-source-mappings --region {{.REGION}} \
-                 --query "EventSourceMappings[?contains(FunctionArn, 'ArchiverFunction')].UUID" --output text)
-        {{.LOCAL_CLI}} lambda update-event-source-mapping --uuid "$UUID" --region {{.REGION}} \
-            --maximum-batching-window-in-seconds 30 --function-response-types ReportBatchItemFailures \
-            --query '{BatchSize:BatchSize,Window:MaximumBatchingWindowInSeconds,ResponseTypes:FunctionResponseTypes}' --output text
+        for i in $(seq 1 30); do
+          docker logs {{.LOCAL_ARCHIVER}} 2>&1 | grep -q '"Output type aws_s3 is now active"' && { echo "archiver is up"; exit 0; }
+          docker ps -q --filter name=^{{.LOCAL_ARCHIVER}}$ --filter status=running | grep -q . || { echo "archiver exited"; docker logs {{.LOCAL_ARCHIVER}}; exit 1; }
+          sleep 1
+        done
+        echo "archiver did not start in time"; docker logs {{.LOCAL_ARCHIVER}}; exit 1
+
+  local:archiver:down:
+    desc: Stop and remove the local archiver container
+    cmds:
+      - docker rm -f {{.LOCAL_ARCHIVER}} >/dev/null 2>&1 || true
+
+  local:archiver:
+    desc: The local archiver container - state and uptime
+    cmds:
+      - docker ps -a --filter name=^{{.LOCAL_ARCHIVER}}$
 
   local:generate:
     desc: Post fake events to the Floci webhook
@@ -313,13 +392,19 @@ tasks:
     desc: Print the Floci webhook URL
     cmds: [{ task: _output, vars: { CLI: "{{.LOCAL_CLI}}", KEY: WebhookUrl } }]
 
+  local:outputs:queue-url:
+    silent: true
+    internal: true
+    cmds: [{ task: _output, vars: { CLI: "{{.LOCAL_CLI}}", KEY: ArchiveQueueUrl } }]
+
   local:logs:
     desc: Tail the webhook Lambda logs in Floci (FOLLOW= to print and exit)
     cmds: [{ task: _lambda-logs, vars: { CLI: "{{.LOCAL_CLI}}", FUNCTION: WebhookFunction } }]
 
   local:logs:archiver:
-    desc: Tail the archiver Lambda logs in Floci (FOLLOW= to print and exit)
-    cmds: [{ task: _lambda-logs, vars: { CLI: "{{.LOCAL_CLI}}", FUNCTION: ArchiverFunction } }]
+    desc: Tail the local archiver container's logs (FOLLOW= to print and exit)
+    cmds:
+      - docker logs {{.FOLLOW}} {{.LOCAL_ARCHIVER}}
 
   local:logs:events:
     desc: Tail every event on the Floci bus (FOLLOW= to print and exit)
@@ -368,9 +453,8 @@ tasks:
       - defer: { task: local:down }
       - task: local:deploy
       - task: local:generate
-      # 30s batching window, plus the archiver's first cold start: Floci copies its 245 MB
-      # binary into a code volume before the first invocation.
-      - echo "waiting 60s for the archiver's batching window and cold start" && sleep 60
+      # The last POST lands at most 30s (the batch period) before its file is written.
+      - echo "waiting 40s for the archiver's batch period" && sleep 40
       - task: local:verify
 
   # ------------------------------------------------------------------ internal

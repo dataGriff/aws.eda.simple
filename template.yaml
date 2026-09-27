@@ -4,8 +4,8 @@ Description: >
   aws.eda.simple - a webhook Lambda (Function URL) that publishes inbound JSON events
   to a custom Amazon EventBridge bus. A catch-all rule fans every event out to a
   CloudWatch log group (so the pipeline can be observed end-to-end) and to an SQS queue
-  drained by a Bento stream running as a Lambda that archives each batch to S3 as
-  gzipped JSON Lines.
+  drained by a Bento stream running as a container on ECS Fargate that archives each
+  batch to S3 as gzipped JSON Lines.
 
 Parameters:
   WebhookSecret:
@@ -24,7 +24,32 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 7
-    Description: Retention for the Lambda and event log groups.
+    Description: Retention for the Lambda, archiver and event log groups.
+  ArchiverDeployment:
+    Type: String
+    Default: fargate
+    AllowedValues: [fargate, none]
+    Description: >-
+      fargate runs the archiver as an ECS service on Fargate (needs ArchiverImage). none
+      creates the queue and the bucket only, for running the same container yourself - which
+      is what the Floci run does with plain docker.
+  ArchiverImage:
+    Type: String
+    Default: ""
+    Description: >-
+      The archiver's container image (ECR URI with a tag). Built from src/archiver/Dockerfile
+      and pushed by `task image:push`; `task deploy` passes it. Ignored when ArchiverDeployment
+      is none.
+  ArchiverDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: >-
+      Archiver tasks to run. 0 pauses the archiver (events wait on the queue, up to 14 days);
+      more than 1 is safe (at-least-once, deduplicated at read time) but pointless at this volume.
+
+Conditions:
+  RunArchiverOnFargate: !Equals [!Ref ArchiverDeployment, fargate]
 
 Globals:
   Function:
@@ -136,7 +161,7 @@ Resources:
           Arn: !GetAtt ArchiveQueue.Arn
 
   # ------------------------------------------------------------------ Archive
-  # events/ holds the archive, one gzipped JSON Lines file per Lambda batch.
+  # events/ holds the archive, one gzipped JSON Lines file per batch.
   LakeBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -157,13 +182,16 @@ Resources:
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
 
-  # The queue is the buffer: if the archiver is broken, events wait here for up to 14 days.
+  # The queue is the buffer: if the archiver is broken or paused, events wait here for up
+  # to 14 days.
   ArchiveQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub ${AWS::StackName}-archive
-      # Six times the archiver's timeout, per the Lambda/SQS guidance.
-      VisibilityTimeout: 360
+      # How long a message a dead archiver had in flight stays hidden before another one
+      # gets it. A live archiver extends this for as long as a message waits in a batch
+      # (aws_sqs input, update_visibility), so it need not cover the batch period.
+      VisibilityTimeout: 90
       MessageRetentionPeriod: 1209600
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ArchiveDeadLetterQueue.Arn
@@ -196,56 +224,252 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${BusName}/${BusName}-catch-all
 
-  # Drains the queue in batches and writes each batch as one file. The envelope is archived
-  # untouched: files have no schema to match, so there is nothing to transform.
+  # ------------------------------------------------------------------ Archiver (Bento on Fargate)
+  # The archiver is a Bento stream (src/archiver/archiver.yaml) in a container
+  # (src/archiver/Dockerfile) run as one long-lived ECS Fargate task: it long-polls the
+  # queue, batches by count and period, writes one gzipped JSON Lines object per batch, and
+  # deletes a message only once the object holding it is on S3. Everything from here to the
+  # end of Resources exists only when ArchiverDeployment is fargate.
   #
-  # This function is a Bento stream (https://warpstreamlabs.github.io/bento), not Python:
-  # the code is src/archiver/archiver.yaml and the runtime is Bento's Lambda build, a single
-  # static binary named `bootstrap` on the provided.al2023 custom runtime. `sam build` runs
-  # src/archiver/Makefile, which downloads the pinned release and stages both files.
-  ArchiverFunction:
-    Type: AWS::Serverless::Function
-    Metadata:
-      BuildMethod: makefile
+  # Fargate needs a network. This is the smallest one that works with no NAT gateway: two
+  # public subnets, an internet gateway, and a public IP on the task, which it uses to reach
+  # ECR, CloudWatch Logs and SQS. Nothing listens on it: the security group has no ingress.
+  # S3 traffic stays off the internet through the (free) gateway endpoint.
+  ArchiverVpc:
+    Type: AWS::EC2::VPC
+    Condition: RunArchiverOnFargate
     Properties:
-      Description: Archives batches of bus events to S3 as gzipped JSON Lines (Bento).
-      CodeUri: src/archiver/
-      Runtime: provided.al2023
-      Handler: bootstrap
-      Timeout: 60
-      # The Bento binary is ~230 MB with every component compiled in; more memory means more
-      # CPU for the cold start, which is where it is spent.
-      MemorySize: 512
-      Environment:
-        Variables:
-          ARCHIVE_BUCKET: !Ref LakeBucket
-          ARCHIVE_PREFIX: events/
-          # Bento looks for ./bento.yaml by default; name the file explicitly instead.
-          BENTO_CONFIG_PATH: /var/task/archiver.yaml
-          LOG_LEVEL: INFO
-      Events:
-        Archive:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt ArchiveQueue.Arn
-            # One file per invocation: 100 events or 30 seconds, whichever comes first.
-            BatchSize: 100
-            MaximumBatchingWindowInSeconds: 30
-            # Report only the messages that could not be archived; the rest are deleted.
-            FunctionResponseTypes:
-              - ReportBatchItemFailures
-      Policies:
-        - Statement:
-            - Sid: WriteArchive
-              Effect: Allow
-              Action: s3:PutObject
-              Resource: !Sub ${LakeBucket.Arn}/events/*
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-archiver
 
-  ArchiverFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
+  ArchiverInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: RunArchiverOnFargate
+
+  ArchiverVpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: RunArchiverOnFargate
     Properties:
-      LogGroupName: !Sub /aws/lambda/${ArchiverFunction}
+      VpcId: !Ref ArchiverVpc
+      InternetGatewayId: !Ref ArchiverInternetGateway
+
+  # Two subnets in two zones: ECS places the task in either, and a zone outage moves it.
+  ArchiverSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: RunArchiverOnFargate
+    Properties:
+      VpcId: !Ref ArchiverVpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  ArchiverSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: RunArchiverOnFargate
+    Properties:
+      VpcId: !Ref ArchiverVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  ArchiverRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: RunArchiverOnFargate
+    Properties:
+      VpcId: !Ref ArchiverVpc
+
+  ArchiverDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: RunArchiverOnFargate
+    DependsOn: ArchiverVpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref ArchiverRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ArchiverInternetGateway
+
+  ArchiverSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: RunArchiverOnFargate
+    Properties:
+      SubnetId: !Ref ArchiverSubnetA
+      RouteTableId: !Ref ArchiverRouteTable
+
+  ArchiverSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: RunArchiverOnFargate
+    Properties:
+      SubnetId: !Ref ArchiverSubnetB
+      RouteTableId: !Ref ArchiverRouteTable
+
+  ArchiverS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: RunArchiverOnFargate
+    Properties:
+      VpcId: !Ref ArchiverVpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref ArchiverRouteTable
+
+  ArchiverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: RunArchiverOnFargate
+    Properties:
+      GroupDescription: Archiver task - outbound only
+      VpcId: !Ref ArchiverVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: ECR, CloudWatch Logs and SQS over HTTPS
+
+  ArchiverCluster:
+    Type: AWS::ECS::Cluster
+    Condition: RunArchiverOnFargate
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-archiver
+
+  ArchiverLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: RunArchiverOnFargate
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}-archiver
       RetentionInDays: !Ref LogRetentionDays
+
+  # Two roles, as ECS wants them: the execution role is what ECS itself uses to pull the
+  # image and ship logs; the task role is what Bento uses, and it can do exactly what the
+  # archiver Lambda's role could - receive and delete on this queue, put under events/ in
+  # this bucket - and nothing else.
+  ArchiverExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: RunArchiverOnFargate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ArchiverTaskRole:
+    Type: AWS::IAM::Role
+    Condition: RunArchiverOnFargate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: archiver
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ConsumeArchiveQueue
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ArchiveQueue.Arn
+              - Sid: WriteArchive
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${LakeBucket.Arn}/events/*
+
+  ArchiverTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: RunArchiverOnFargate
+    Properties:
+      Family: !Sub ${AWS::StackName}-archiver
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      # The smallest Fargate size. Bento idles at a few tens of MB; a 100-event batch is
+      # a few hundred KB of work.
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: ARM64
+      ExecutionRoleArn: !GetAtt ArchiverExecutionRole.Arn
+      TaskRoleArn: !GetAtt ArchiverTaskRole.Arn
+      ContainerDefinitions:
+        - Name: archiver
+          Image: !Ref ArchiverImage
+          Essential: true
+          # The whole runtime configuration: src/archiver/archiver.yaml reads these and
+          # nothing else. Region and credentials come from the task role and ECS itself.
+          Environment:
+            - Name: ARCHIVE_QUEUE_URL
+              Value: !Ref ArchiveQueue
+            - Name: ARCHIVE_BUCKET
+              Value: !Ref LakeBucket
+            - Name: ARCHIVE_PREFIX
+              Value: events/
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            # One file per 100 events or 30 seconds, whichever comes first - the same shape
+            # as the Lambda version. Bigger, fewer files are one edit away (bento.md).
+            - Name: BATCH_COUNT
+              Value: "100"
+            - Name: BATCH_PERIOD
+              Value: 30s
+            - Name: LOG_LEVEL
+              Value: INFO
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ArchiverLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: archiver
+          # Bento answers /ready once its input and output are connected. wget is busybox's,
+          # present in the official image.
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4195/ready || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+          # On SIGTERM Bento stops reading, finishes the batch in hand and acks it
+          # (shutdown_timeout 20s by default); give it that long before the SIGKILL.
+          StopTimeout: 30
+
+  ArchiverService:
+    Type: AWS::ECS::Service
+    Condition: RunArchiverOnFargate
+    # Tasks pull the image over the internet gateway, so the route must exist first.
+    DependsOn: [ArchiverDefaultRoute, ArchiverS3Endpoint]
+    Properties:
+      ServiceName: archiver
+      Cluster: !Ref ArchiverCluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref ArchiverTaskDefinition
+      DesiredCount: !Ref ArchiverDesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref ArchiverSubnetA
+            - !Ref ArchiverSubnetB
+          SecurityGroups:
+            - !Ref ArchiverSecurityGroup
+      # A new image or config rolls out as a new task next to the old one; two consumers on
+      # the queue for a minute is harmless (at-least-once, dedupe at read time). A task that
+      # keeps failing its health check rolls the deployment back instead of flapping.
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      PropagateTags: SERVICE
 
 Outputs:
   WebhookUrl:
@@ -271,3 +495,15 @@ Outputs:
   DeadLetterQueueUrl:
     Description: Messages the archiver rejected three times. Should stay empty.
     Value: !Ref ArchiveDeadLetterQueue
+  ArchiverCluster:
+    Condition: RunArchiverOnFargate
+    Description: ECS cluster running the archiver service.
+    Value: !Ref ArchiverCluster
+  ArchiverService:
+    Condition: RunArchiverOnFargate
+    Description: ECS service name of the archiver (one Fargate task).
+    Value: !GetAtt ArchiverService.Name
+  ArchiverLogGroup:
+    Condition: RunArchiverOnFargate
+    Description: Log group of the archiver container - one line per batch written.
+    Value: !Ref ArchiverLogGroup

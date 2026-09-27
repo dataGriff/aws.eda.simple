@@ -13,8 +13,8 @@ You need: a laptop with Docker and [mise](https://mise.jdx.dev), and an AWS acco
 local emulator, [Floci](https://floci.io), needs no account and no token.
 
 ```
-producer → Function URL → webhook Lambda → EventBridge bus ─┬─→ CloudWatch Logs               (watch)
-                                                            └─→ SQS → archiver Lambda (Bento) → S3   (keep)
+producer → Function URL → webhook Lambda → EventBridge bus ─┬─→ CloudWatch Logs                       (watch)
+                                                            └─→ SQS → archiver (Bento on Fargate) → S3   (keep)
                                                                        gzipped JSON Lines ─→ DuckDB / Harlequin
 ```
 
@@ -39,7 +39,7 @@ new type or a new field inside `data` cannot break ingestion, archiving or the b
 | 1 | The event **source** name | `EventSource` parameter in `template.yaml` (default), `samconfig.toml` overrides | `com.example.shop` |
 | 2 | The **allowed types** | `ALLOWED_TYPES` in `src/webhook/app.py` | `order.created`, `order.updated`, `payment.received` |
 | 3 | What each type's **`data` looks like** | `generator/generate.py`: `EVENT_TYPES` and one `make_*` function per type | orders with `items`, payments with `amount` |
-| 4 | **Sample payloads** for local invokes and tests | `events/post.json`, `events/sqs.json`, `sample_event()` in `tests/helpers.py` | an `order.created` |
+| 4 | **Sample payloads** for local invokes and tests | `events/post.json`, `sample_event()` in `tests/helpers.py` | an `order.created` |
 | 5 | **Domain views** over the payload | `queries/views.sql` below the `events` view, `queries/examples.sql` | `orders`, `order_items`, `payments` |
 | 6 | The **contract table** in the README | README "Event contract" | the `type` row |
 
@@ -52,7 +52,7 @@ domain-free and stays as it is.
 1. `EventSource` default → `com.example.sensors`; bus name to taste.
 2. `ALLOWED_TYPES = frozenset({"sensor.reading", "sensor.alert"})`.
 3. Generator: `EVENT_TYPES = ("sensor.reading", "sensor.alert")`, a `make_reading()` and `make_alert()` returning the `data` dicts, and `make_event()` dispatching on type. Keep `_envelope()`; it builds the fixed part.
-4. `sample_event()` returns a `sensor.reading`; regenerate `events/post.json` and `events/sqs.json` from it.
+4. `sample_event()` returns a `sensor.reading`; regenerate `events/post.json` from it.
 5. Views: replace `orders`/`order_items`/`payments` with, say,
    ```sql
    CREATE OR REPLACE VIEW readings AS
@@ -142,20 +142,20 @@ read-side tests fail before anything is deployed.
 
 ## Task 5 - Keep the events: SQS, an archiver, gzipped JSON Lines on S3
 
-**Goal:** a second target on the same rule sends every event to a queue; a Lambda drains it in batches and writes each batch as one file under `events/dt=YYYY-MM-DD/`. Bad messages are dead-lettered on their own. Nothing here knows what your events mean.
+**Goal:** a second target on the same rule sends every event to a queue; a Bento stream in a container drains it and writes each batch as one file under `events/dt=YYYY-MM-DD/`. Bad messages are dead-lettered on their own. Nothing here knows what your events mean. The container runs on ECS Fargate in task 8 and next to Floci in task 7; this task builds and tests it without either.
 
 **Do**
 
-1. `AWS::S3::Bucket` with public access blocked and SSE-S3. Two `AWS::SQS::Queue`s: the archive queue (`VisibilityTimeout` six times the Lambda timeout, 14-day retention, `RedrivePolicy` with `maxReceiveCount: 3`) and its dead-letter queue.
+1. `AWS::S3::Bucket` with public access blocked and SSE-S3. Two `AWS::SQS::Queue`s: the archive queue (`VisibilityTimeout: 90` - long enough for a dead consumer's messages to come back, not a batch period; the consumer extends it while batching - 14-day retention, `RedrivePolicy` with `maxReceiveCount: 3`) and its dead-letter queue.
 2. `AWS::SQS::QueuePolicy` allowing `events.amazonaws.com` `sqs:SendMessage`, with `aws:SourceArn` pinned to the rule. Build the rule ARN with `!Sub` (`arn:…:events:…:rule/<bus>/<rule-name>`) rather than `!GetAtt`, so the rule can `DependsOn` the policy without a cycle. Add the queue as the rule's second target.
-3. `src/archiver/archiver.yaml`, a [Bento](https://warpstreamlabs.github.io/bento/) stream run by Bento's Lambda build (no `input`: the Lambda event is the message). One `mapping` processor: a body that is a JSON object becomes one line (the SQS bytes verbatim); anything else is a failure by `messageId`, kept in metadata; the object key `events/dt=…/<timestamp>Z-<uuid>.jsonl.gz` (UTC, no colons) goes in metadata too. Then `compress: gzip`. The `output` is a `switch`: nothing archivable → `sync_response` with `{"batchItemFailures": [...]}`; otherwise a `fan_out_sequential` broker to `aws_s3` (`content_type: application/x-ndjson`, **no** `content_encoding`) and then the same `sync_response`. Whatever reaches `sync_response` is the Lambda's return value.
-4. In the template: `Runtime: provided.al2023`, `Handler: bootstrap`, `Metadata: BuildMethod: makefile`, `BENTO_CONFIG_PATH: /var/task/archiver.yaml`; `Events: Archive: Type: SQS` with `BatchSize: 100`, `MaximumBatchingWindowInSeconds: 30`, `FunctionResponseTypes: [ReportBatchItemFailures]`; an inline policy for `s3:PutObject` on `events/*` only. `src/archiver/Makefile` downloads the pinned `bootstrap_<version>_linux_<arch>.zip` from Bento's GitHub releases into `~/.cache/bento-lambda`, verifies the sha256, and copies `bootstrap` and the config into `$(ARTIFACTS_DIR)`. Add `bento` to `mise.toml` (`github:warpstreamlabs/bento`, same version).
-5. Tests, in `src/archiver/archiver_bento_test.yaml` (`bento test ./src/...`): N good bodies → gzip that round-trips to N lines plus a trailing newline, bytes identical to the bodies; a multi-line body is re-serialised onto one line; a bad body → its id in the `failed` metadata and the good ones still present; nothing archivable → empty body; empty batch → harmless; key format; the response mapping lists only the failed ids. `events/sqs.json` is a two-message batch for `task invoke:archiver` (yours #4) - or for the Lambda Runtime Interface Emulator, which runs `bootstrap` without Docker.
-6. Tasks: `logs:archiver`, `queues`, `errors`, `archive`, `bucket`, `empty-bucket`. Write each inspection command once as an internal task taking a `CLI` variable (`aws`, or `aws --endpoint-url …` with dummy credentials) and add thin public wrappers - the `local:` twins in task 7 then cost one line each.
+3. `src/archiver/archiver.yaml`, a [Bento](https://warpstreamlabs.github.io/bento/) stream, configured by environment variables only. `input: aws_sqs` (`url: ${ARCHIVE_QUEUE_URL}`, `wait_time_seconds: 20`; leave `delete_message`, `update_visibility` and `reset_visibility` on - they are the delivery contract). One `mapping` processor: a body that is a JSON object becomes one line (the SQS bytes verbatim, re-serialised only if it spans lines); anything else `throw`s, which flags the message as errored. The `output` is `reject_errored` (errored messages are nacked back to SQS) around `retry` (`max_elapsed_time: 5m`) around `aws_s3` (`content_type: application/x-ndjson`, **no** `content_encoding`, `force_path_style_urls: ${S3_FORCE_PATH_STYLE:false}` for emulators) with `batching: count: ${BATCH_COUNT:100}, period: ${BATCH_PERIOD:30s}` and batch processors: `mapping: meta archived = batch_size()`, `archive: lines`, a `mapping` that appends the trailing newline and puts the object key `events/dt=…/<timestamp>Z-<uuid>.jsonl.gz` (UTC, no colons) in metadata, `compress: gzip`, `log`. Add an `http` section so `/ready` exists for the health check.
+4. `src/archiver/Dockerfile`: `FROM ghcr.io/warpstreamlabs/bento:<version>`, `COPY archiver.yaml /archiver.yaml`, `CMD ["-c", "/archiver.yaml"]`. No `RUN`, so `docker build --platform linux/arm64` works on any host. Add `bento` to `mise.toml` (`github:warpstreamlabs/bento`, same version), and `moto[server]` to the dev requirements.
+5. Tests. `src/archiver/archiver_bento_test.yaml` (`bento test ./src/...`) on the mapping: an envelope is kept byte for byte and not errored; a multi-line body is re-serialised onto one line; a bad body is errored and its neighbours are not. On the batching processors (`target_processors: /output/reject_errored/retry/output/aws_s3/batching/processors`): N lines in → gzip that round-trips to N lines plus a trailing newline, `archived` metadata, key format. Then `tests/test_archiver_stream.py`: start `python -m moto.server` on a free port, create the two queues with the template's redrive policy and a bucket, launch the real `bento -c src/archiver/archiver.yaml` with the same environment variables the task definition will have plus `AWS_ENDPOINT_URL`, `S3_FORCE_PATH_STYLE=true` and `BATCH_PERIOD=1s`, and assert: the object, its content type, its lines, the bad message in the dead-letter queue, the archive queue empty, and DuckDB reading the object through `views.sql`. A second test starts with a missing bucket and asserts the message stays in flight until the bucket appears and the write lands.
+6. Tasks: `image:build` (`ARCH` defaults to `arm64`; the tag is a hash of the Dockerfile and the config), `logs:archiver`, `queues`, `errors`, `archive`, `bucket`, `empty-bucket`. Write each inspection command once as an internal task taking a `CLI` variable (`aws`, or `aws --endpoint-url …` with dummy credentials) and add thin public wrappers - the `local:` twins in task 7 then cost one line each.
 
-**Check:** `task ci` green.
+**Check:** `task ci` green - the stream test takes about 16 seconds and needs neither AWS nor Docker.
 
-> **Why Bento:** this Lambda is a stream job - parse, batch, compress, write - and Bento says that in forty lines of YAML with the S3 client, gzip and retries built in; see `bento.md` for what it improved and what it cost. **Why only this Lambda:** Bento has no EventBridge output, so the webhook (`PutEvents`) stays Python. **Why no transform:** the archive is the bus envelope byte for byte. Files have no schema to match, so there is nothing to reshape and nothing a new payload field can break - this is what makes the pipeline domain-free. **Why at-least-once is fine:** if the S3 write fails the whole batch is redelivered, so an event can appear in two files; task 6 dedupes on the envelope `id` at read time. **Why `ReportBatchItemFailures`:** one unparseable message should not poison ninety-nine good ones. **Why no `ContentEncoding: gzip`:** DuckDB keys on the `.gz` extension; a transport-level encoding header invites double decompression.
+> **Why Bento, and why a service:** the archiver is a stream job - poll, batch, compress, write, ack - and Bento says that in seventy lines of YAML with the SQS client, the S3 client, gzip and retries built in. In a Lambda it lost its input and its batching to the event source mapping (the previous branch); as a service it keeps them, and it is tested offline exactly as it runs. See `bento.md` for what that costs - a VPC, ECS and about $11 a month - and for why it is still not an improvement for a pipeline this small. **Why only the archiver:** Bento has no EventBridge output, so the webhook (`PutEvents`) stays Python. **Why no transform:** the archive is the bus envelope byte for byte. Files have no schema to match, so there is nothing to reshape and nothing a new payload field can break - this is what makes the pipeline domain-free; `bento.md` measures why writing Parquet here would not help. **Why at-least-once is fine:** a message is deleted only after its file is on S3, so a crash in between redelivers the batch and an event can appear in two files; task 6 dedupes on the envelope `id` at read time. **Why `retry` around `aws_s3`:** found by the stream test - without it the output nacks on the first failed write and a blip on S3 costs one of the queue's three receives. **Why `reject_errored`:** one unparseable message should not poison ninety-nine good ones, and SQS already knows how to retry and dead-letter one message. **Why no `ContentEncoding: gzip`:** DuckDB keys on the `.gz` extension; a transport-level encoding header invites double decompression. **Gotcha:** a nack resets visibility to zero and the Go SDK omits a zero `VisibilityTimeout` from the batch request; AWS reads the missing field as zero, moto rejects it - hence the test queues' 3-second visibility timeout.
 
 ---
 
@@ -183,32 +183,34 @@ read-side tests fail before anything is deployed.
 **Do**
 
 1. `samconfig.toml` gains a `[local]` environment: same stack name, `resolve_s3 = true`, your `EventSource`, and a fixed non-secret `WebhookSecret` (it only ever guards localhost).
-2. `local:up`: `docker run -d --name floci-main -p 4566:4566 -e FLOCI_DEFAULT_REGION=<region> -v /var/run/docker.sock:/var/run/docker.sock floci/floci:latest`, then poll `/_floci/health` (up in a few seconds). Precondition: no `floci-main` container already exists. `local:down`: `docker stop`, `docker rm -f`, then remove the `floci-<stack>-*` Lambda containers Floci leaves behind.
-3. `local:deploy`: `samlocal build --build-dir .aws-sam/local --cache-dir .aws-sam/local-cache` with `BENTO_ARCH` set to the host's architecture (`uname -m`, mapped to `amd64`/`arm64`), and `samlocal deploy --config-env local --config-file <repo>/samconfig.toml --template-file .aws-sam/local/template.yaml` - a separate build dir so local and AWS builds never overwrite each other, a separate cache dir because SAM's cache key is the source hash and does not know the archiver binary's architecture, and `--config-file` because SAM looks for `samconfig.toml` next to the template. Then one Floci-specific step: `aws lambda update-event-source-mapping --maximum-batching-window-in-seconds 30 --function-response-types ReportBatchItemFailures` on the archiver's mapping, because Floci's CloudFormation drops both properties (see the parity notes below).
+2. `local:up`: `docker run -d --name floci-main -p 4566:4566 -e FLOCI_DEFAULT_REGION=<region> -v /var/run/docker.sock:/var/run/docker.sock floci/floci:latest`, then poll `/_floci/health` (up in a few seconds). Precondition: no `floci-main` container already exists. `local:down`: remove the archiver container, `docker stop`, `docker rm -f`, then remove the `floci-<stack>-*` Lambda containers Floci leaves behind.
+3. `local:deploy`: `samlocal build --build-dir .aws-sam/local` and `samlocal deploy --config-env local --config-file <repo>/samconfig.toml --template-file .aws-sam/local/template.yaml` - a separate build dir so local and AWS builds never overwrite each other, and `--config-file` because SAM looks for `samconfig.toml` next to the template. The `[local]` overrides include `ArchiverDeployment=none` (task 8 adds that parameter), so the stack has the queue and the bucket and no ECS. Then `local:archiver:up`: `task image:build ARCH=<host arch>` and `docker run -d --name floci-archiver --add-host host.docker.internal:host-gateway` with the queue URL from the stack outputs, the bucket, `AWS_ENDPOINT_URL=http://host.docker.internal:4566`, `S3_FORCE_PATH_STYLE=true`, the region and dummy credentials; wait for `Output type aws_s3 is now active` in its logs.
 4. `local:generate`: posts to `http://localhost:4566/` with the Function URL's hostname in the `Host` header (the generator's `--host`). Floci's URLs are `<id>.lambda-url.<region>.localhost:4566`, which resolves without DNS on most systems, so the plain URL works too; the header route is kept because it is emulator-independent.
-5. `local:outputs`, `local:resources`, `local:logs`, `local:logs:events`, `local:logs:archiver`, `local:queues`, `local:errors`, `local:archive`, `local:duckdb`, `local:query`, `local:harlequin`, `local:health`: the same internal helpers with `CLI: aws --endpoint-url http://localhost:4566` and dummy credentials, and the DuckDB secret `KEY_ID 'test', SECRET 'test', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path'`.
-6. `local:verify` asserts the DuckDB count equals `EXPECT`; `local:e2e` chains up → deploy → generate → wait 45s → verify, with a deferred `local:down`.
+5. `local:outputs`, `local:resources`, `local:logs`, `local:logs:events`, `local:queues`, `local:errors`, `local:archive`, `local:duckdb`, `local:query`, `local:harlequin`, `local:health`: the same internal helpers with `CLI: aws --endpoint-url http://localhost:4566` and dummy credentials, and the DuckDB secret `KEY_ID 'test', SECRET 'test', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path'`. `local:logs:archiver` and `local:archiver` are `docker logs` and `docker ps` on the container.
+6. `local:verify` asserts the DuckDB count equals `EXPECT`; `local:e2e` chains up → deploy → generate → wait 40s → verify, with a deferred `local:down`.
 7. CI: a second job with no secrets: `task install`, `task local:e2e`.
 
 **Check:** `task local:e2e` ends with `events archived: 30 (expected 30)`. Push; both CI jobs green. Then leave Floci up and try `task local:resources`, `task local:queues`, `task local:archive`, `task local:logs:archiver FOLLOW=`.
 
-> **Why Floci works here:** CloudFormation with the SAM transform, Lambda in real Docker containers (on the host's architecture, so `arm64` functions run on x86 runners - which is exactly why the archiver's native binary is fetched per host), custom runtimes (`provided.al2023`), Function URLs, SQS event source mappings, EventBridge → SQS, S3 - all present, starting in about three seconds with no account. **Parity gaps in 2.1.0, all characterised by running this pipeline:** (1) `FunctionUrlConfig` is not expanded - hence the explicit resources in task 2; (2) CloudFormation drops the mapping's batching window and response types - hence the post-deploy patch, after which batching works; (3) `ReportBatchItemFailures` is ignored at runtime, so a rejected message is dropped with its batch rather than retried and dead-lettered - `task local:errors` always reports 0; (4) the EventBridge → CloudWatch Logs target is unsupported, so `task local:logs:events` is empty. None affect AWS. The LocalStack variant of this repo (`feat/sqs-archiver`) has none of these gaps but needs an auth token and starts far slower - pick by what you need to exercise locally.
+> **Why Floci works here:** CloudFormation with the SAM transform, Lambda in real Docker containers (on the host's architecture, so the `arm64` webhook runs on x86 runners), Function URLs, EventBridge → SQS, SQS with visibility timeouts and dead-letter queues, S3 - all present, starting in about three seconds with no account. **Why the archiver runs beside Floci rather than in it:** Floci lists ECS, ECR and VPC resources as emulated, but a plain `docker run` of the identical image, pointed at Floci by `AWS_ENDPOINT_URL`, has fewer moving parts and proves the thing that matters - that nothing in the config is emulator-specific; the stream test in task 5 pins that with a queue URL whose host does not resolve. **Parity gaps in 2.1.0, characterised by running this pipeline:** (1) `FunctionUrlConfig` is not expanded - hence the explicit resources in task 2; (2) the EventBridge → CloudWatch Logs target is unsupported, so `task local:logs:events` is empty. The Lambda archiver's two gaps (event source mapping properties dropped, `ReportBatchItemFailures` ignored) went away with the Lambda. None affect AWS.
 
 ---
 
-## Task 8 - Deploy to AWS
+## Task 8 - Deploy to AWS: the archiver on Fargate
 
-**Goal:** the same template live in your account, verified the same way.
+**Goal:** the same template live in your account, with the archiver as one Fargate task, verified the same way.
 
 **Do**
 
-1. `WEBHOOK_SECRET=$(openssl rand -hex 24)` - export it or put it in `.env`, and keep it.
-2. `task deploy` → `task outputs` → `task resources`. Then `task generate`, wait 45 seconds, `task errors` (expect "no delivery errors"), `task archive`, `task logs:events FOLLOW=`, `task query`.
-3. Try the curl checks in the README: 405, 401, 400, 202.
+1. In `template.yaml`, behind a parameter `ArchiverDeployment` (`fargate` | `none`) and a condition: the smallest network Fargate can use without a NAT gateway - a VPC, two public subnets in two zones, an internet gateway, a route table with a default route, an S3 gateway endpoint, a security group with no ingress; an `AWS::ECS::Cluster`; a log group; an execution role with `AmazonECSTaskExecutionRolePolicy` and a task role allowing `sqs:ReceiveMessage/DeleteMessage/ChangeMessageVisibility/GetQueueAttributes` on the queue and `s3:PutObject` on `events/*`; an `AWS::ECS::TaskDefinition` (`FARGATE`, `awsvpc`, `256`/`512`, `ARM64`, `Image: !Ref ArchiverImage`, the environment variables from task 5, `awslogs`, a `HealthCheck` of `wget -q -O /dev/null http://127.0.0.1:4195/ready`, `StopTimeout: 30`); and an `AWS::ECS::Service` (`DesiredCount: !Ref ArchiverDesiredCount`, `AssignPublicIp: ENABLED`, the circuit breaker with rollback, `DependsOn` the route and the endpoint). Outputs for the cluster, the service and the log group, conditional too.
+2. Tasks: `image:push` (`aws ecr describe-repositories || create-repository`, `get-login-password | docker login`, tag, push, print the URI); `deploy` depends on `build` and `image:push` and passes `ArchiverImage=<uri>`; `archiver` (`describe-services` → desired/running/pending, rollout state, last event); `archiver:scale N=…`; `delete` also deletes the ECR repository.
+3. `WEBHOOK_SECRET=$(openssl rand -hex 24)` - export it or put it in `.env`, and keep it.
+4. `task deploy` → `task outputs` → `task archiver` (expect 1 running, `COMPLETED`). Then `task generate`, wait 45 seconds, `task errors` (expect "no delivery errors"), `task archive`, `task logs:archiver FOLLOW=`, `task query`.
+5. Try the curl checks in the README: 405, 401, 400, 202.
 
 **Check:** `task query` prints the same tables you saw locally.
 
-> **Why last:** by now every component has been proven locally; the AWS deploy only tests IAM, the queue policy and CloudFormation itself. If the archive stays empty, `task queues` tells you whether events reach SQS and `task logs:archiver` tells you what the Lambda thought of them.
+> **Why last:** by now every component has been proven locally; the AWS deploy tests IAM, the queue policy, the network and CloudFormation itself. If the archive stays empty, `task queues` tells you whether events reach SQS, `task archiver` whether the task is running, and `task logs:archiver` what it thought of them. **Why the repository is created by the Taskfile, not the stack:** the service needs the image at creation time, and the image cannot be pushed before the repository exists - a stack that owns both never converges on first deploy. **Why a content-hashed tag:** an unchanged archiver redeploys as a no-op; `latest` would redeploy the task every time and hide what changed. **Why `DependsOn` the route:** without it CloudFormation starts the service before the task can reach ECR, the pull fails, the circuit breaker trips, and the stack rolls back for a reason that looks like a permissions problem. **Why a public IP and no NAT:** a NAT gateway costs more per month than the task; the S3 endpoint keeps the archive traffic private and the security group keeps everything else out.
 
 ---
 
@@ -217,9 +219,10 @@ read-side tests fail before anything is deployed.
 **Goal:** know what to look at when something is wrong, and leave nothing behind. Every command below has a `local:` twin.
 
 - Pipeline lag: `task query` → the lag query compares `archived_at` (from the file name) with `event_time`. Expect roughly the batching window.
-- Something rejected: `task errors` shows the dead-letter depth; `task logs:archiver` shows `message_rejected` with the message id. Read the message from the DLQ, fix the producer, redrive.
-- Nothing arriving: `task resources` (everything `CREATE_COMPLETE`?), `task queues` (are events reaching SQS at all?), then the rule's `FailedInvocations` metric - the silent-failure signal for both targets.
-- Tear down: `task empty-bucket` (deliberately separate - it deletes the archive), then `task delete`. `task local:down` for Floci.
+- Something rejected: `task errors` shows the dead-letter depth; `task logs:archiver` shows `body is not a JSON object` from the mapping. Read the message from the DLQ, fix the producer, redrive.
+- Nothing arriving: `task resources` (everything `CREATE_COMPLETE`?), `task archiver` (a task running, rollout `COMPLETED`?), `task queues` (are events reaching SQS at all, are they stuck in flight?), then the rule's `FailedInvocations` metric - the silent-failure signal for both targets. The alarm worth having is `ApproximateAgeOfOldestMessage` on the archive queue: it rises whether the archiver is dead, wedged or paused.
+- Paying for nothing: `task archiver:scale N=0` stops the task; the queue holds two weeks of events. `N=1` or the next deploy starts it again.
+- Tear down: `task empty-bucket` (deliberately separate - it deletes the archive), then `task delete` (stack and ECR repository). `task local:down` for Floci and the local archiver.
 
 ---
 
@@ -230,7 +233,7 @@ If you built the shop version first and now want your own events, change these a
 1. `template.yaml` → `EventSource` default; `samconfig.toml` → the two `EventSource=` overrides.
 2. `src/webhook/app.py` → `ALLOWED_TYPES`.
 3. `generator/generate.py` → `EVENT_TYPES`, one `make_*` per type, the dispatch in `make_event`.
-4. `tests/helpers.py` → `sample_event()`; regenerate `events/post.json` and `events/sqs.json`.
+4. `tests/helpers.py` → `sample_event()`; regenerate `events/post.json`.
 5. `queries/views.sql` → the views below `events`; `queries/examples.sql`.
 6. README → the `type` row of the contract table, and any example SQL.
 
@@ -241,7 +244,9 @@ step surfaces - before anything is deployed.
 
 ## What you could add next
 
-- **Partitioning by hour** if the day prefixes get large: change `object_key`; DuckDB picks up the extra Hive key automatically.
-- **An Iceberg table** built *from* the archive with DuckDB or PyIceberg, if you want snapshots, time travel or a catalog. Ingestion does not change.
+- **Bigger, fewer files**: `BATCH_COUNT=1000`, `BATCH_PERIOD=5m` in the task definition. The queue extends visibility while a batch waits, so nothing else changes.
+- **Partitioning by hour or by type** if the day prefixes get large: change the key in the `name_object` mapping; DuckDB picks up the extra Hive key automatically. Per-type partitions mean one file per type per batch - see `bento.md`.
+- **Validation per event type**: a `json_schema` processor per `detail-type` in the same config, with failures routed to a `quarantine/` prefix instead of nacked. Still no code.
+- **Typed Parquet or Iceberg tables** built *from* the archive with DuckDB, PyIceberg or Athena, per type, if you want columns, snapshots or a catalog. Ingestion does not change - `bento.md` measures why writing Parquet in the archiver would not help.
 - **A FIFO queue** if you ever need ordering per entity; you lose the 100-message batches.
 - **Authentication beyond a shared secret**: `AuthType: AWS_IAM` on the Function URL, or an API Gateway in front for WAF and throttling. The webhook's validation does not change.

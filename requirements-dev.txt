@@ -6,10 +6,11 @@ pytest>=8
 ruff>=0.6
 Faker>=26
 duckdb>=1.1
+# S3 and SQS on localhost for tests/test_archiver_stream.py, which runs the real archiver binary.
+moto[server]>=5
 
 # SAM CLI is needed for build/deploy. Uncomment to install via pip, or install
 # it with brew / pipx instead: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html
 # aws-sam-cli>=1.120
-# Local run (make local-*): samlocal points SAM at LocalStack. LocalStack itself is
-# started with plain docker, so its CLI is not needed (and it conflicts with SAM's click pin).
+# Local run (task local:*): samlocal points SAM at Floci, which is started with plain docker.
 # aws-sam-cli-local>=1.0
