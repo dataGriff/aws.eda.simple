@@ -1,0 +1,2 @@
+# Intentionally empty: boto3 is provided by the python3.12 Lambda runtime.
+# Pin boto3 here only if you need a feature newer than the runtime's bundled version.
