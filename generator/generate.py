@@ -131,10 +131,13 @@ def build_payload(batch_size: int, fake: Faker, orders: OrderMemory, types: list
     return batch[0] if batch_size == 1 else batch
 
 
-def post(url: str, secret: str, payload, timeout: float = 10.0) -> tuple[int, str]:
+def post(
+    url: str, secret: str, payload, timeout: float = 10.0, host: str | None = None
+) -> tuple[int, str]:
     """POST the payload and return (status_code, body).
 
-    Raises urllib.error.URLError on connection failure.
+    ``host`` overrides the Host header, for endpoints routed by hostname that your DNS
+    cannot resolve (LocalStack Function URLs). Raises urllib.error.URLError on connection failure.
     """
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(  # noqa: S310 (scheme is whatever the user passed)
@@ -143,6 +146,8 @@ def post(url: str, secret: str, payload, timeout: float = 10.0) -> tuple[int, st
         method="POST",
         headers={"Content-Type": "application/json", AUTH_HEADER: secret},
     )
+    if host:
+        req.add_unredirected_header("Host", host)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (https URL from user)
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -169,6 +174,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--secret",
         default=os.environ.get("WEBHOOK_SECRET"),
         help="Shared secret (env WEBHOOK_SECRET)",
+    )
+    p.add_argument(
+        "--host",
+        default=os.environ.get("WEBHOOK_HOST"),
+        help="Override the Host header (env WEBHOOK_HOST); for LocalStack Function URLs",
     )
     p.add_argument("--interval", type=float, default=2.0, help="Seconds between POSTs (default 2)")
     p.add_argument("--count", type=int, default=0, help="Number of POSTs; 0 = run until Ctrl-C")
@@ -211,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(payload, indent=2))
             else:
                 try:
-                    status, body = post(args.url, args.secret, payload)
+                    status, body = post(args.url, args.secret, payload, host=args.host)
                 except urllib.error.URLError as exc:
                     failed += 1
                     print(f"[{stamp}] POST {n} event(s) -> connection error: {exc.reason}")

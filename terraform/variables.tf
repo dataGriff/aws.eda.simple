@@ -50,3 +50,9 @@ variable "log_level" {
   type        = string
   default     = "INFO"
 }
+
+variable "aws_endpoint_url" {
+  description = "Point every AWS API call at this URL instead of AWS, e.g. http://localhost:4566 for LocalStack. Leave null for real AWS."
+  type        = string
+  default     = null
+}

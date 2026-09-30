@@ -15,7 +15,7 @@ flowchart LR
     B -- "CatchAllRule<br/>source = com.example.shop" --> C[CloudWatch Logs<br/>/aws/events/simple-eda-bus]
 ```
 
-Everything is deployed with **Terraform** from the `terraform/` directory. The Lambda has **no third-party dependencies** (boto3 ships with the runtime), so there is no build step: Terraform zips `src/webhook/` itself.
+Everything is deployed with **Terraform** from the `terraform/` directory, to AWS or into **LocalStack** with no AWS account at all. The Lambda has **no third-party dependencies** (boto3 ships with the runtime), so there is no build step: Terraform zips `src/webhook/` itself.
 
 ## Project layout
 
@@ -24,14 +24,15 @@ terraform/main.tf           Terraform: bus, Lambda + Function URL, IAM, rule, lo
 terraform/variables.tf      Inputs (name, region, bus name, event source, retention, secret)
 terraform/outputs.tf        Outputs (webhook URL, bus name/ARN, log group)
 terraform/versions.tf       Provider versions and optional S3 backend example
-Makefile                    install / lint / test / validate / plan / deploy / generate / logs / delete
+Makefile                    install / lint / test / validate / plan / deploy / generate / logs / delete, plus local-* for LocalStack
 src/webhook/app.py          Lambda handler and pure helper functions
 generator/generate.py       Fake data generator CLI (runs locally, not deployed)
 scripts/invoke_local.py     Runs the handler in-process with a sample event (no SAM needed)
+scripts/verify_events.py    End-to-end assertion: the events log group holds exactly the events sent
 tests/                      pytest unit tests (botocore Stubber, no AWS account needed)
 events/post.json            Sample Function URL event for `make invoke-local`
 env.example.json            Template for local env vars (copy to env.json, git-ignored)
-.github/workflows/ci.yml    Lint + tests + `terraform fmt -check` + `terraform validate`
+.github/workflows/ci.yml    Lint + tests + terraform validate, then the end-to-end run in LocalStack
 ```
 
 ## Event contract
@@ -67,9 +68,9 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 
 ## Prerequisites
 
-- An AWS account and credentials configured for the AWS CLI
-- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [Terraform](https://developer.hashicorp.com/terraform/install) 1.5 or newer
-- Python 3.12 (3.11 also works for local tests) and `make`
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.5 or newer, Python 3.12 (3.11 also works for local tests) and `make`
+- To deploy to AWS: an AWS account and credentials configured for the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+- To run it locally instead: Docker and a free [LocalStack](https://app.localstack.cloud) auth token
 
 ## Setup
 
@@ -79,7 +80,44 @@ source .venv/bin/activate
 make lint test          # ruff + 60-odd unit tests, no AWS needed
 ```
 
-## Deploy
+## Run the whole thing locally (LocalStack)
+
+The pipeline runs unchanged in [LocalStack](https://localstack.cloud): same Terraform, same Lambda, same
+generator. No AWS account, no secret to generate. This is also the end-to-end test CI runs on every push.
+
+```bash
+export LOCALSTACK_AUTH_TOKEN=...   # free tier is fine; see below
+make local-e2e                     # up, deploy, generate, verify - then tears LocalStack down
+```
+
+or step by step, leaving LocalStack up to poke at:
+
+```bash
+make local-up           # docker run localstack/localstack, waits for healthy
+make local-deploy       # terraform apply with -var aws_endpoint_url=http://localhost:4566, workspace "local"
+make local-generate     # 10 POSTs, 3 events each, at the local Function URL
+make local-verify       # polls /aws/events/simple-eda-bus until 30 well-formed, unique events arrive
+make local-logs-events  # print every event on the local bus
+make local-logs         # print the local Lambda's logs
+make local-down
+```
+
+The Terraform variable `aws_endpoint_url` is all that differs: when set, the AWS provider uses dummy credentials, skips
+its AWS-only checks and sends every API call to that URL. LocalStack state lives in its own Terraform workspace
+(`local`, under `terraform/terraform.tfstate.d/`, git-ignored) so it never mixes with the AWS state.
+
+`make local-generate` posts to `localhost:4566` with the Function URL's hostname in the `Host` header (the
+generator's `--host` flag), which is how LocalStack routes Function URLs anyway, so it works even where your
+resolver refuses the `*.localhost.localstack.cloud` wildcard.
+
+`make local-up` is a plain `docker run` of `localstack/localstack`. LocalStack needs an **auth token even on its
+free Hobby tier** (the image exits with "License activation failed" without one), so create an account at
+[app.localstack.cloud](https://app.localstack.cloud) and export `LOCALSTACK_AUTH_TOKEN` first. The token lives in
+your shell (or a CI secret), never in git. `LAMBDA_IGNORE_ARCHITECTURE=1` is set for you so the `arm64` function
+runs on an x86 host. CI runs `make local-e2e` on every push, with the token as the `LOCALSTACK_AUTH_TOKEN`
+repository secret; see `.github/workflows/ci.yml`.
+
+## Deploy to AWS
 
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -hex 24)   # keep this, the generator needs it
@@ -179,3 +217,4 @@ make delete             # terraform destroy, removes everything including log gr
 - The Lambda log group is created explicitly (with retention) and the function depends on it, so Lambda never auto-creates an unmanaged, never-expiring group.
 - The `lambda:InvokeFunctionUrl` permission for principal `*` (which SAM added implicitly) is an explicit `aws_lambda_permission`; without it the public URL returns `403`.
 - `tests/test_generator.py` feeds the generator's output through the Lambda's own `validate_event`, so the two sides of the contract cannot drift apart.
+- `scripts/verify_events.py` is the end-to-end oracle: it reads the events log group back and checks the count, the `source`, that `detail-type`/`time` mirror the inbound `type`/`timestamp`, and that no `id` was delivered twice.
