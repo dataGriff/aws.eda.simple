@@ -1,0 +1,73 @@
+# Unit tests for archiver.yaml, run with `bento test ./src/...` (part of `task test`).
+# Each test feeds messages through one slice of the config and checks what comes out: the
+# per-message mapping, or the output's batching processors that turn a batch into a file.
+# No AWS: the SQS input and the S3 output are exercised by tests/test_archiver_stream.py,
+# which runs the real binary against a moto server.
+
+tests:
+  - name: an envelope is kept verbatim, one compact line, no error
+    target_processors: /pipeline/processors
+    input_batch:
+      - content: '{"version":"0","id":"bus-1","detail-type":"order.created","source":"com.example.shop","time":"2026-09-26T14:47:03Z","detail":{"id":"evt_1","type":"order.created","timestamp":"2026-09-26T14:47:03Z","data":{"order_id":"ord_1","total":19.98,"items":[{"sku":"SKU-1","qty":2}]}}}'
+    output_batches:
+      - - content_equals: '{"version":"0","id":"bus-1","detail-type":"order.created","source":"com.example.shop","time":"2026-09-26T14:47:03Z","detail":{"id":"evt_1","type":"order.created","timestamp":"2026-09-26T14:47:03Z","data":{"order_id":"ord_1","total":19.98,"items":[{"sku":"SKU-1","qty":2}]}}}'
+          bloblang: 'root = !errored()'
+
+  - name: a body that spans lines is re-serialised onto one line, a padded one is trimmed
+    target_processors: /pipeline/processors
+    input_batch:
+      - content: "{\n  \"id\": \"bus-1\",\n  \"n\": 1\n}"
+      - content: "  {\"z\":1,\"a\":2}  "
+    output_batches:
+      - - bloblang: 'root = content().string().parse_json() == {"id":"bus-1","n":1} && !content().string().contains("\n") && !errored()'
+        - content_equals: '{"z":1,"a":2}'
+          bloblang: 'root = !errored()'
+
+  - name: a body that is not a JSON object is flagged as an error, the rest are not
+    target_processors: /pipeline/processors
+    input_batch:
+      - content: '{"id":"bus-a"}'
+      - content: '{not json'
+      - content: '"a bare string"'
+      - content: '[1, 2, 3]'
+      - content: '{"id":"bus-b"}'
+    output_batches:
+      - - bloblang: 'root = !errored()'
+        - bloblang: 'root = errored()'
+        - bloblang: 'root = errored()'
+        - bloblang: 'root = errored()'
+        - bloblang: 'root = !errored()'
+
+  # The batching processors: a batch of lines becomes one gzipped object with a name.
+  - name: a batch becomes one gzipped file, one line per message, trailing newline
+    target_processors: /output/reject_errored/retry/output/aws_s3/batching/processors
+    environment:
+      ARCHIVE_PREFIX: events/
+    input_batch:
+      - content: '{"id":"bus-1"}'
+      - content: '{"id":"bus-2"}'
+      - content: '{"id":"bus-3"}'
+    output_batches:
+      - - bloblang: 'root = content().decompress("gzip").string() == "{\"id\":\"bus-1\"}\n{\"id\":\"bus-2\"}\n{\"id\":\"bus-3\"}\n"'
+          metadata_equals:
+            archived: 3
+
+  - name: object key partitions by day and stamps the batch, under ARCHIVE_PREFIX
+    target_processors: /output/reject_errored/retry/output/aws_s3/batching/processors
+    environment:
+      ARCHIVE_PREFIX: custom/
+    input_batch:
+      - content: '{"id":"bus-1"}'
+    output_batches:
+      - - bloblang: |
+            root = @key.re_match("^custom/dt=\\d{4}-\\d{2}-\\d{2}/\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z-[0-9a-f-]{36}\\.jsonl\\.gz$") &&
+            @key.contains("dt=" + now().ts_tz("UTC").ts_format("2006-01-02"))
+
+  - name: a batch of one is a file of one line
+    target_processors: /output/reject_errored/retry/output/aws_s3/batching/processors
+    input_batch:
+      - content: '{"id":"bus-only"}'
+    output_batches:
+      - - bloblang: 'root = content().decompress("gzip").string() == "{\"id\":\"bus-only\"}\n"'
+          metadata_equals:
+            archived: 1

@@ -1,0 +1,593 @@
+# Single entry point for developers, AI agents and CI. Tools come from mise.toml.
+# `task --list` shows everything; `task ci` is what CI runs; `task local:e2e` is the
+# whole pipeline in Floci, a local AWS emulator, with the archiver container beside it.
+# Every AWS task has a `local:` twin that talks to it.
+version: "3"
+
+# Local secrets live in .env (gitignored), e.g. WEBHOOK_SECRET. Missing file is fine -
+# CI has none and gets its secrets from the environment. Floci itself needs no token.
+dotenv: [".env"]
+
+vars:
+  STACK: aws-eda-simple
+  REGION: eu-west-1
+  BUS_NAME: simple-eda-bus
+  EVENT_SOURCE: com.example.shop
+  PY: .venv/bin/python
+  QUERY_FILE: queries/examples.sql
+  # Log tasks follow by default; pass FOLLOW= to print the last 10 minutes and exit.
+  FOLLOW: "--follow"
+  # Extra duckdb CLI flags, e.g. DUCKDB_FLAGS=-dark-mode if your terminal does not
+  # answer DuckDB's background-colour probe.
+  DUCKDB_FLAGS: ""
+  # Floci. The webhook secret here is deliberately not secret: it only ever guards
+  # a webhook on localhost.
+  LOCAL_ENDPOINT: http://localhost:4566
+  # Dummy credentials Floci accepts. Passed to helper tasks explicitly: a task's
+  # env: block applies to its own commands, not to tasks it calls.
+  LOCAL_AWS_ENV: "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION={{.REGION}}"
+  LOCAL_IMAGE: floci/floci:latest
+  LOCAL_SECRET: local-dev-secret-0123456789
+  # Separate build dir so a local build never overwrites an AWS one (or vice versa).
+  LOCAL_BUILD_DIR: .aws-sam/local
+  # The archiver container next to Floci. Same image as Fargate, built for the host's
+  # architecture; the queue and bucket come from the Floci stack, the endpoint is Floci's.
+  LOCAL_ARCHIVER: floci-archiver
+  HOST_ARCH:
+    sh: uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/'
+  # The archiver image. Built from src/archiver/ (Bento's official image plus archiver.yaml),
+  # pushed to an ECR repository the deploy creates on first use. The tag is a hash of the
+  # image's inputs: an unchanged archiver deploys as the same tag and ECS leaves it alone;
+  # a changed one is a new task definition and a rolling replacement.
+  ECR_REPO: "{{.STACK}}-archiver"
+  IMAGE_TAG:
+    sh: cat src/archiver/Dockerfile src/archiver/archiver.yaml | shasum -a 256 | cut -c1-12
+  LOCAL_BUCKET: "{{.STACK}}-lake-000000000000-{{.REGION}}"
+  LOCAL_ARCHIVE: "s3://{{.LOCAL_BUCKET}}/events/**/*.jsonl.gz"
+  EXPECT: 30
+  # The two ways to run the AWS CLI. Every inspection helper takes one of these as CLI,
+  # so a command exists once and works against AWS and Floci alike.
+  AWS_CLI: aws
+  LOCAL_CLI: "{{.LOCAL_AWS_ENV}} aws --endpoint-url {{.LOCAL_ENDPOINT}}"
+  # DuckDB session set-up. One place, so the AWS and Floci query tasks cannot drift.
+  DUCKDB_BOOT: "INSTALL httpfs; LOAD httpfs;"
+  AWS_SECRET_SQL: "CREATE OR REPLACE SECRET (TYPE s3, PROVIDER credential_chain, REGION '{{.REGION}}');"
+  LOCAL_SECRET_SQL: "CREATE OR REPLACE SECRET (TYPE s3, KEY_ID 'test', SECRET 'test', REGION '{{.REGION}}', ENDPOINT 'localhost:4566', USE_SSL false, URL_STYLE 'path');"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  # ------------------------------------------------------------------ develop
+  install:
+    desc: Create .venv and install dev dependencies
+    cmds:
+      - python -m venv .venv
+      - "{{.PY}} -m pip install --quiet --upgrade pip"
+      - "{{.PY}} -m pip install --quiet -r requirements-dev.txt"
+
+  lint:
+    desc: Run ruff lint + format check, and lint the Bento archiver config
+    cmds:
+      - "{{.PY}} -m ruff check ."
+      - "{{.PY}} -m ruff format --check ."
+      - bento lint --skip-env-var-check src/archiver/archiver.yaml
+
+  fmt:
+    desc: Auto-fix lint and format
+    cmds:
+      - "{{.PY}} -m ruff check --fix ."
+      - "{{.PY}} -m ruff format ."
+
+  test:
+    desc: Run the tests - pytest (webhook, generator, views, and the archiver binary against a moto server), bento test (no AWS, no Docker)
+    cmds:
+      - "{{.PY}} -m pytest"
+      - bento test ./src/...
+
+  validate:
+    desc: Validate the SAM template
+    cmds:
+      - sam validate --lint --region {{.REGION}}
+
+  ci:
+    desc: What CI runs first - lint, tests, template validation
+    cmds:
+      - task: lint
+      - task: test
+      - task: validate
+
+  build:
+    desc: Build the SAM application (the webhook; the archiver is an image, see image:build)
+    cmds:
+      - sam build
+
+  image:build:
+    desc: Build the archiver image (ARCH=arm64 for Fargate; the Dockerfile has no RUN, so no emulation is needed)
+    vars:
+      ARCH: '{{.ARCH | default "arm64"}}'
+    cmds:
+      - docker build --platform linux/{{.ARCH}} -t {{.ECR_REPO}}:{{.IMAGE_TAG}} src/archiver
+
+  # ------------------------------------------------------------------ AWS
+  image:push:
+    desc: Push the archiver image to ECR (creates the repository on first use) and print its URI
+    deps: [image:build]
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+      REGISTRY: "{{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com"
+    cmds:
+      - >-
+        aws ecr describe-repositories --repository-names {{.ECR_REPO}} --region {{.REGION}} >/dev/null 2>&1 ||
+        aws ecr create-repository --repository-name {{.ECR_REPO}} --region {{.REGION}}
+        --image-scanning-configuration scanOnPush=true --query repository.repositoryUri --output text
+      - aws ecr get-login-password --region {{.REGION}} | docker login --username AWS --password-stdin {{.REGISTRY}}
+      - docker tag {{.ECR_REPO}}:{{.IMAGE_TAG}} {{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}
+      - docker push --quiet {{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}
+      - echo "{{.REGISTRY}}/{{.ECR_REPO}}:{{.IMAGE_TAG}}"
+
+  deploy:
+    desc: Deploy the stack to AWS - image to ECR, then sam deploy (requires WEBHOOK_SECRET in the environment)
+    deps: [build, image:push]
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+      IMAGE: "{{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com/{{.ECR_REPO}}:{{.IMAGE_TAG}}"
+    preconditions:
+      - sh: test -n "$WEBHOOK_SECRET"
+        msg: "WEBHOOK_SECRET is not set - export it or put it in .env; generate one with: openssl rand -hex 24"
+    cmds:
+      - >-
+        sam deploy --stack-name {{.STACK}} --region {{.REGION}}
+        --parameter-overrides WebhookSecret=$WEBHOOK_SECRET BusName={{.BUS_NAME}} EventSource={{.EVENT_SOURCE}}
+        ArchiverImage={{.IMAGE}}
+
+  deploy:guided:
+    desc: Interactive first-time deploy (the image is pushed first; answer ArchiverImage with the URI it prints)
+    deps: [build, image:push]
+    cmds:
+      - sam deploy --guided --stack-name {{.STACK}} --region {{.REGION}}
+
+  generate:
+    desc: Post fake events to the deployed webhook (requires WEBHOOK_SECRET)
+    vars:
+      URL:
+        sh: task url
+    preconditions:
+      - sh: test -n "$WEBHOOK_SECRET"
+        msg: WEBHOOK_SECRET is not set - export it or put it in .env
+    cmds:
+      - WEBHOOK_URL={{.URL}} {{.PY}} generator/generate.py --interval 2 --batch-size 3 --count 10
+
+  # --- look inside the AWS stack
+  outputs:
+    desc: Stack outputs
+    cmds: [{ task: _outputs, vars: { CLI: "{{.AWS_CLI}}" } }]
+
+  resources:
+    desc: Every resource in the stack, with type and status
+    cmds: [{ task: _resources, vars: { CLI: "{{.AWS_CLI}}" } }]
+
+  url:
+    silent: true
+    desc: Print the webhook URL
+    cmds: [{ task: _output, vars: { CLI: "{{.AWS_CLI}}", KEY: WebhookUrl } }]
+
+  bucket:
+    silent: true
+    desc: Print the lake bucket name
+    cmds: [{ task: _output, vars: { CLI: "{{.AWS_CLI}}", KEY: LakeBucketName } }]
+
+  logs:
+    desc: Tail the webhook Lambda logs (FOLLOW= to print and exit)
+    cmds: [{ task: _lambda-logs, vars: { CLI: "{{.AWS_CLI}}", FUNCTION: WebhookFunction } }]
+
+  logs:archiver:
+    desc: Tail the archiver container's logs - one line per batch written (FOLLOW= to print and exit)
+    cmds: [{ task: _log-tail, vars: { CLI: "{{.AWS_CLI}}", GROUP: "/ecs/{{.STACK}}-archiver" } }]
+
+  archiver:
+    desc: The archiver service - tasks desired/running/pending, the rollout state, and the last ECS event
+    silent: true
+    cmds:
+      - >-
+        aws ecs describe-services --cluster {{.STACK}}-archiver --services archiver --region {{.REGION}}
+        --query 'services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,
+        rollout:deployments[0].rolloutState,image:deployments[0].taskDefinition,lastEvent:events[0].message}'
+        --output table
+
+  archiver:scale:
+    desc: Run N archiver tasks - `task archiver:scale N=0` pauses it, events wait on the queue (a deploy resets N)
+    requires: { vars: [N] }
+    cmds:
+      - >-
+        aws ecs update-service --cluster {{.STACK}}-archiver --service archiver --region {{.REGION}}
+        --desired-count {{.N}} --query 'service.{desired:desiredCount,running:runningCount}' --output text
+
+  logs:events:
+    desc: Tail every event on the bus, via the catch-all rule (FOLLOW= to print and exit)
+    cmds: [{ task: _log-tail, vars: { CLI: "{{.AWS_CLI}}", GROUP: "/aws/events/{{.BUS_NAME}}" } }]
+
+  queues:
+    desc: Depth of the archive queue and its dead-letter queue
+    cmds: [{ task: _queues, vars: { CLI: "{{.AWS_CLI}}" } }]
+
+  errors:
+    desc: Dead-letter queue depth - how many messages the archiver rejected (should be 0)
+    cmds: [{ task: _errors, vars: { CLI: "{{.AWS_CLI}}" } }]
+
+  archive:
+    desc: List the archive files on S3, with a total
+    vars:
+      BUCKET:
+        sh: task bucket
+    cmds: [{ task: _archive, vars: { CLI: "{{.AWS_CLI}}", BUCKET: "{{.BUCKET}}" } }]
+
+  duckdb:
+    desc: Open the DuckDB prompt over the deployed archive, views loaded
+    vars:
+      BUCKET:
+        sh: task bucket
+    cmds:
+      - task: _duckdb
+        vars: { SECRET_SQL: "{{.AWS_SECRET_SQL}}", ARCHIVE: "s3://{{.BUCKET}}/events/**/*.jsonl.gz" }
+
+  harlequin:
+    desc: Open Harlequin (SQL IDE in the terminal) over the deployed archive, views loaded
+    vars:
+      BUCKET:
+        sh: task bucket
+    cmds:
+      - task: _harlequin
+        vars: { SECRET_SQL: "{{.AWS_SECRET_SQL}}", ARCHIVE: "s3://{{.BUCKET}}/events/**/*.jsonl.gz" }
+
+  query:
+    desc: Run a SQL file over the deployed archive (QUERY_FILE=queries/examples.sql)
+    vars:
+      BUCKET:
+        sh: task bucket
+    cmds:
+      - task: _query
+        vars: { SECRET_SQL: "{{.AWS_SECRET_SQL}}", ARCHIVE: "s3://{{.BUCKET}}/events/**/*.jsonl.gz" }
+
+  invoke:webhook:
+    desc: Invoke the webhook in a local container with events/post.json (needs env.json)
+    cmds:
+      - sam local invoke WebhookFunction -e events/post.json --env-vars env.json
+
+  empty-bucket:
+    desc: Empty the lake bucket (CloudFormation cannot delete a bucket with objects)
+    vars:
+      BUCKET:
+        sh: task bucket
+    cmds:
+      - aws s3 rm "s3://{{.BUCKET}}/" --recursive --region {{.REGION}}
+
+  delete:
+    desc: Delete the AWS stack and the archiver's ECR repository (run empty-bucket first)
+    cmds:
+      - sam delete --stack-name {{.STACK}} --region {{.REGION}} --no-prompts
+      # Created by image:push, not by the stack, so removed here.
+      - aws ecr delete-repository --repository-name {{.ECR_REPO}} --region {{.REGION}} --force --query repository.repositoryName --output text || true
+
+  # ------------------------------------------------------------------ Floci
+  # The whole pipeline on your machine: no AWS account, no WEBHOOK_SECRET, no auth token.
+  # Floci (https://floci.io) is a free AWS emulator; Lambda runs in real Docker containers.
+  local:up:
+    desc: Start Floci in Docker and wait until it is healthy
+    preconditions:
+      - sh: test -z "$(docker ps -aq --filter name=^floci-main$)"
+        msg: "a floci-main container already exists - run `task local:down` first"
+    cmds:
+      # Floci runs functions on the host's native architecture, so arm64 functions work on x86 too.
+      - >-
+        docker run -d --name floci-main -p 4566:4566
+        -e FLOCI_DEFAULT_REGION={{.REGION}}
+        -v /var/run/docker.sock:/var/run/docker.sock {{.LOCAL_IMAGE}}
+      - |
+        echo "waiting for {{.LOCAL_ENDPOINT}} ..."
+        for i in $(seq 1 60); do
+          curl -sf {{.LOCAL_ENDPOINT}}/_floci/health >/dev/null && { echo "Floci is up"; exit 0; }
+          sleep 2
+        done
+        echo "Floci did not come up in time"; docker logs floci-main | tail -20; exit 1
+      # Pull the Lambda runtime image now rather than inside the first invocation: on a fresh
+      # machine or CI runner the pull is ~780 MB and would otherwise eat the first request.
+      - docker pull -q public.ecr.aws/lambda/python:3.12
+
+  local:down:
+    desc: Stop and remove Floci (deletes everything in it)
+    cmds:
+      - task: local:archiver:down
+      # Stop gracefully first so Floci removes the Lambda containers it started; sweep any
+      # it left behind (they are named floci-<stack>-<function>-<id>).
+      - docker stop floci-main
+      - docker rm -f floci-main
+      - docker ps -aq --filter name=^floci-{{.STACK}}- | xargs docker rm -f 2>/dev/null || true
+
+  local:deploy:
+    desc: Build and deploy the stack into Floci, then start the archiver container next to it
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: "{{.REGION}}"
+    cmds:
+      # SAM looks for samconfig.toml next to the template, so name it when building elsewhere.
+      # The [local] config env deploys with ArchiverDeployment=none: the bus, webhook, queue
+      # and bucket, but no ECS - the archiver is the container started below.
+      - samlocal build --build-dir {{.LOCAL_BUILD_DIR}}
+      - samlocal deploy --config-env local --config-file {{.ROOT_DIR}}/samconfig.toml --template-file {{.LOCAL_BUILD_DIR}}/template.yaml
+      - task: local:archiver:up
+
+  local:archiver:up:
+    desc: Build the archiver image for this host and run it against Floci's queue and bucket
+    vars:
+      QUEUE_URL:
+        sh: task local:outputs:queue-url
+    cmds:
+      - task: image:build
+        vars: { ARCH: "{{.HOST_ARCH}}" }
+      - docker rm -f {{.LOCAL_ARCHIVER}} >/dev/null 2>&1 || true
+      # The same image and the same environment variables as the Fargate task definition,
+      # plus the three an emulator needs: an endpoint, path-style S3 and dummy credentials.
+      # host.docker.internal is the host from inside a container (Docker Desktop resolves it
+      # natively; --add-host makes Linux do the same).
+      - >-
+        docker run -d --name {{.LOCAL_ARCHIVER}} --add-host host.docker.internal:host-gateway
+        -e ARCHIVE_QUEUE_URL={{.QUEUE_URL}} -e ARCHIVE_BUCKET={{.LOCAL_BUCKET}} -e ARCHIVE_PREFIX=events/
+        -e BATCH_COUNT=100 -e BATCH_PERIOD=30s -e LOG_LEVEL=INFO
+        -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 -e S3_FORCE_PATH_STYLE=true
+        -e AWS_REGION={{.REGION}} -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test
+        {{.ECR_REPO}}:{{.IMAGE_TAG}}
+      - |
+        for i in $(seq 1 30); do
+          docker logs {{.LOCAL_ARCHIVER}} 2>&1 | grep -q '"Output type aws_s3 is now active"' && { echo "archiver is up"; exit 0; }
+          docker ps -q --filter name=^{{.LOCAL_ARCHIVER}}$ --filter status=running | grep -q . || { echo "archiver exited"; docker logs {{.LOCAL_ARCHIVER}}; exit 1; }
+          sleep 1
+        done
+        echo "archiver did not start in time"; docker logs {{.LOCAL_ARCHIVER}}; exit 1
+
+  local:archiver:down:
+    desc: Stop and remove the local archiver container
+    cmds:
+      - docker rm -f {{.LOCAL_ARCHIVER}} >/dev/null 2>&1 || true
+
+  local:archiver:
+    desc: The local archiver container - state and uptime
+    cmds:
+      - docker ps -a --filter name=^{{.LOCAL_ARCHIVER}}$
+
+  local:generate:
+    desc: Post fake events to the Floci webhook
+    vars:
+      # Function URLs are routed by hostname. Posting to localhost with the URL's host in
+      # the Host header works even where the emulator's wildcard DNS does not resolve.
+      HOST:
+        sh: task local:url | sed -E 's#^https?://([^/:]+).*#\1#'
+    cmds:
+      - echo "POSTing to {{.LOCAL_ENDPOINT}}/ as {{.HOST}}"
+      - >-
+        WEBHOOK_URL={{.LOCAL_ENDPOINT}}/ WEBHOOK_HOST={{.HOST}} WEBHOOK_SECRET={{.LOCAL_SECRET}}
+        {{.PY}} generator/generate.py --interval 1 --batch-size 3 --count 10 --timeout 60
+
+  # --- look inside Floci: the same helpers, pointed at the local endpoint
+  local:health:
+    desc: Floci health
+    cmds:
+      - curl -sf {{.LOCAL_ENDPOINT}}/_floci/health | {{.PY}} -m json.tool
+
+  local:outputs:
+    desc: Stack outputs in Floci
+    cmds: [{ task: _outputs, vars: { CLI: "{{.LOCAL_CLI}}" } }]
+
+  local:resources:
+    desc: Every resource in the Floci stack, with type and status
+    cmds: [{ task: _resources, vars: { CLI: "{{.LOCAL_CLI}}" } }]
+
+  local:url:
+    silent: true
+    desc: Print the Floci webhook URL
+    cmds: [{ task: _output, vars: { CLI: "{{.LOCAL_CLI}}", KEY: WebhookUrl } }]
+
+  # No desc, so it stays out of `task --list`; not internal, because local:archiver:up runs it
+  # through `sh:` to read the queue URL, and internal tasks cannot be called that way.
+  local:outputs:queue-url:
+    silent: true
+    cmds: [{ task: _output, vars: { CLI: "{{.LOCAL_CLI}}", KEY: ArchiveQueueUrl } }]
+
+  local:logs:
+    desc: Tail the webhook Lambda logs in Floci (FOLLOW= to print and exit)
+    cmds: [{ task: _lambda-logs, vars: { CLI: "{{.LOCAL_CLI}}", FUNCTION: WebhookFunction } }]
+
+  local:logs:archiver:
+    desc: Tail the local archiver container's logs (FOLLOW= to print and exit)
+    cmds:
+      - docker logs {{.FOLLOW}} {{.LOCAL_ARCHIVER}}
+
+  local:logs:events:
+    desc: Tail every event on the Floci bus (FOLLOW= to print and exit)
+    cmds: [{ task: _log-tail, vars: { CLI: "{{.LOCAL_CLI}}", GROUP: "/aws/events/{{.BUS_NAME}}" } }]
+
+  local:queues:
+    desc: Depth of the Floci archive queue and its dead-letter queue
+    cmds: [{ task: _queues, vars: { CLI: "{{.LOCAL_CLI}}" } }]
+
+  local:errors:
+    desc: Floci dead-letter queue depth (should be 0)
+    cmds: [{ task: _errors, vars: { CLI: "{{.LOCAL_CLI}}" } }]
+
+  local:archive:
+    desc: List the archive files in Floci S3, with a total
+    cmds: [{ task: _archive, vars: { CLI: "{{.LOCAL_CLI}}", BUCKET: "{{.LOCAL_BUCKET}}" } }]
+
+  local:duckdb:
+    desc: Open the DuckDB prompt over the Floci archive, views loaded
+    cmds:
+      - task: _duckdb
+        vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
+
+  local:harlequin:
+    desc: Open Harlequin over the Floci archive, views loaded
+    cmds:
+      - task: _harlequin
+        vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
+
+  local:query:
+    desc: Run a SQL file over the Floci archive (QUERY_FILE=queries/examples.sql)
+    cmds:
+      - task: _query
+        vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
+
+  local:verify:
+    desc: Assert the Floci archive holds EXPECT events (default 30)
+    cmds:
+      - task: _verify
+        vars: { SECRET_SQL: "{{.LOCAL_SECRET_SQL}}", ARCHIVE: "{{.LOCAL_ARCHIVE}}" }
+
+  local:e2e:
+    desc: The whole pipeline in Floci - up, deploy, generate, verify; what CI runs
+    cmds:
+      - task: local:up
+      - defer: { task: local:down }
+      - task: local:deploy
+      - task: local:generate
+      # The last POST lands at most 30s (the batch period) before its file is written.
+      - echo "waiting 40s for the archiver's batch period" && sleep 40
+      - task: local:verify
+
+  # ------------------------------------------------------------------ internal
+  # Inspection helpers. CLI is either AWS_CLI or LOCAL_CLI; nothing else differs.
+  _output:
+    internal: true
+    silent: true
+    requires: { vars: [CLI, KEY] }
+    cmds:
+      - >-
+        {{.CLI}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}}
+        --query "Stacks[0].Outputs[?OutputKey=='{{.KEY}}'].OutputValue" --output text
+
+  _outputs:
+    internal: true
+    silent: true
+    requires: { vars: [CLI] }
+    cmds:
+      - >-
+        {{.CLI}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}}
+        --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+
+  _resources:
+    internal: true
+    silent: true
+    requires: { vars: [CLI] }
+    cmds:
+      - >-
+        {{.CLI}} cloudformation list-stack-resources --stack-name {{.STACK}} --region {{.REGION}}
+        --query 'StackResourceSummaries[].[LogicalResourceId,ResourceType,ResourceStatus]' --output table
+
+  _lambda-logs:
+    internal: true
+    silent: true
+    requires: { vars: [CLI, FUNCTION] }
+    cmds:
+      - |
+        NAME=$({{.CLI}} cloudformation describe-stack-resource --stack-name {{.STACK}} --region {{.REGION}} \
+                 --logical-resource-id {{.FUNCTION}} --query StackResourceDetail.PhysicalResourceId --output text)
+        {{.CLI}} logs tail "/aws/lambda/$NAME" --region {{.REGION}} {{.FOLLOW}} --format short
+
+  _log-tail:
+    internal: true
+    silent: true
+    requires: { vars: [CLI, GROUP] }
+    cmds:
+      - "{{.CLI}} logs tail {{.GROUP}} --region {{.REGION}} {{.FOLLOW}} --format short"
+
+  _queues:
+    internal: true
+    silent: true
+    requires: { vars: [CLI] }
+    cmds:
+      - |
+        for KEY in ArchiveQueueUrl DeadLetterQueueUrl; do
+          URL=$({{.CLI}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}} \
+                  --query "Stacks[0].Outputs[?OutputKey=='$KEY'].OutputValue" --output text)
+          {{.CLI}} sqs get-queue-attributes --queue-url "$URL" --region {{.REGION}} \
+              --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+              --query "[['$KEY', Attributes.ApproximateNumberOfMessages, Attributes.ApproximateNumberOfMessagesNotVisible]]" \
+              --output text
+        done | awk 'BEGIN { printf "%-20s %8s %11s\n", "queue", "visible", "in flight" } { printf "%-20s %8s %11s\n", $1, $2, $3 }'
+
+  _errors:
+    internal: true
+    silent: true
+    requires: { vars: [CLI] }
+    cmds:
+      - |
+        DLQ=$({{.CLI}} cloudformation describe-stacks --stack-name {{.STACK}} --region {{.REGION}} \
+                --query "Stacks[0].Outputs[?OutputKey=='DeadLetterQueueUrl'].OutputValue" --output text)
+        N=$({{.CLI}} sqs get-queue-attributes --queue-url "$DLQ" --region {{.REGION}} \
+              --attribute-names ApproximateNumberOfMessages \
+              --query Attributes.ApproximateNumberOfMessages --output text)
+        if [ "$N" = "0" ]; then echo "no delivery errors"; else echo "$N message(s) in the dead-letter queue: $DLQ"; exit 1; fi
+
+  _archive:
+    internal: true
+    silent: true
+    requires: { vars: [CLI, BUCKET] }
+    cmds:
+      - "{{.CLI}} s3 ls s3://{{.BUCKET}}/events/ --recursive --human-readable --summarize --region {{.REGION}}"
+
+  _duckdb:
+    internal: true
+    requires: { vars: [SECRET_SQL, ARCHIVE] }
+    cmds:
+      - echo "Views - events, orders, order_items, payments (queries/views.sql). Leave with .quit"
+      - echo "Try - SELECT event_type, count(*) FROM events GROUP BY 1;"
+      - >-
+        duckdb {{.DUCKDB_FLAGS}}
+        -cmd "{{.DUCKDB_BOOT}} {{.SECRET_SQL}} SET VARIABLE archive = '{{.ARCHIVE}}';"
+        -cmd ".read queries/views.sql"
+
+  # Harlequin has no `.read`, so the boot SQL and the views go into one init script.
+  _harlequin:
+    internal: true
+    silent: true
+    requires: { vars: [SECRET_SQL, ARCHIVE] }
+    vars:
+      INIT: "{{.ROOT_DIR}}/.aws-sam/harlequin-init.sql"
+    cmds:
+      - mkdir -p "{{.ROOT_DIR}}/.aws-sam"
+      - |
+        {
+          echo "{{.DUCKDB_BOOT}}"
+          echo "{{.SECRET_SQL}}"
+          echo "SET VARIABLE archive = '{{.ARCHIVE}}';"
+          cat queries/views.sql
+        } > "{{.INIT}}"
+      - echo "Views - events, orders, order_items, payments. Ctrl-Q quits, F1 for help."
+      - harlequin --init-path "{{.INIT}}"
+
+  _query:
+    internal: true
+    requires: { vars: [SECRET_SQL, ARCHIVE] }
+    cmds:
+      - >-
+        duckdb {{.DUCKDB_FLAGS}} -box
+        -cmd "{{.DUCKDB_BOOT}} {{.SECRET_SQL}} SET VARIABLE archive = '{{.ARCHIVE}}';"
+        -cmd ".read queries/views.sql"
+        -c ".read {{.QUERY_FILE}}"
+
+  _verify:
+    internal: true
+    requires: { vars: [SECRET_SQL, ARCHIVE] }
+    cmds:
+      - |
+        N=$(duckdb -noheader -csv \
+              -cmd "{{.DUCKDB_BOOT}} {{.SECRET_SQL}} SET VARIABLE archive = '{{.ARCHIVE}}';" \
+              -cmd ".read queries/views.sql" \
+              -c "SELECT count(*) FROM events;" | tail -1)
+        case "$N" in ''|*[!0-9]*) echo "count query failed (got '$N')"; exit 1;; esac
+        echo "events archived: $N (expected {{.EXPECT}})"
+        test "$N" = "{{.EXPECT}}"

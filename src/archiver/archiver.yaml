@@ -1,0 +1,118 @@
+# Archiver as a long-running Bento stream: SQS in, one gzipped JSON Lines object per batch
+# on S3 out. Runs as a container on ECS Fargate (src/archiver/Dockerfile), or anywhere else
+# a container runs - `task local:deploy` starts the same image next to Floci with docker.
+#
+# Bento does everything the Lambda event source mapping used to: long polling, batching by
+# count and period, retries, and acknowledging (deleting) a message only once the file that
+# holds it is on S3. A message whose body is not a JSON object is rejected instead, so SQS
+# redelivers it and, after maxReceiveCount attempts, dead-letters it on its own.
+#
+# The envelope is archived exactly as delivered - nothing added, renamed or flattened. The
+# archive is the bus, byte for byte; DuckDB does the interpreting at query time.
+#
+# Delivery is at-least-once: if the process dies between the S3 write and the SQS delete,
+# the batch comes back and lands in a second file. The `events` view in queries/views.sql
+# dedupes on the envelope id.
+
+# /ping and /ready for the container health check, /metrics for Prometheus if ever scraped.
+http:
+  address: 0.0.0.0:4195
+
+logger:
+  level: ${LOG_LEVEL:INFO}
+  format: json
+  add_timestamp: false
+
+input:
+  aws_sqs:
+    url: ${ARCHIVE_QUEUE_URL}
+    # Long polling: one request per 20 s when the queue is idle, immediate when it is not.
+    wait_time_seconds: 20
+    max_number_of_messages: 10
+    # Defaults, spelled out because they are the delivery contract: a message is deleted
+    # only when its batch has been written (delete_message), its visibility timeout is
+    # extended while it waits in a batch (update_visibility), and a rejected message is
+    # made visible again at once so SQS retries it (reset_visibility).
+    delete_message: true
+    update_visibility: true
+    reset_visibility: true
+    # Region, credentials and endpoint come from the environment: the task role on Fargate,
+    # AWS_ENDPOINT_URL and dummy keys against Floci. Nothing here is emulator-specific.
+
+pipeline:
+  processors:
+    # One archive line per message. A body that is a JSON object is kept as the bytes SQS
+    # delivered (re-serialised only if it spans lines, which would break JSON Lines). Anything
+    # else is flagged as an error; the output below rejects it and SQS takes it from there.
+    - label: one_line_per_envelope
+      mapping: |
+        let raw = content().string().trim()
+        let envelope = $raw.parse_json().catch(null)
+        root = if $envelope.type() != "object" {
+          throw("body is not a JSON object")
+        } else if $raw.contains("\n") {
+          $envelope.string()
+        } else {
+          $raw
+        }
+
+output:
+  # Errored messages are nacked back to SQS (redelivered, then dead-lettered after three
+  # receives); everything else goes to S3. The SQS delete happens only when the write succeeds.
+  reject_errored:
+    # A failed write is retried here, with backoff, for up to RETRY_FOR before the batch is
+    # nacked and SQS redelivers it. Without this wrapper aws_s3 nacks on the first failure and
+    # a blip on S3 costs one of the queue's three receives.
+    retry:
+      backoff:
+        initial_interval: 1s
+        max_interval: 30s
+        max_elapsed_time: ${RETRY_FOR:5m}
+      output:
+        aws_s3:
+          bucket: ${ARCHIVE_BUCKET}
+          path: '${! metadata("key") }'
+          # No content_encoding on purpose: DuckDB keys on the .gz extension, and a
+          # transport-level encoding invites double decompression in some clients.
+          content_type: application/x-ndjson
+          # Floci and other S3 emulators live on one host with no wildcard DNS; AWS needs the default.
+          force_path_style_urls: ${S3_FORCE_PATH_STYLE:false}
+          max_in_flight: 1
+          timeout: 30s
+          # One file per batch: BATCH_COUNT events or BATCH_PERIOD, whichever comes first. This
+          # is the batching the Lambda event source mapping used to do, without its 5-minute
+          # ceiling. Messages stay invisible on the queue while they wait here (update_visibility).
+          batching:
+            count: ${BATCH_COUNT:100}
+            period: ${BATCH_PERIOD:30s}
+            processors:
+              - label: count_batch
+                mapping: 'meta archived = batch_size()'
+
+              # Newline-delimited JSON, one envelope per line, trailing newline. The archived
+              # message keeps the first message's metadata, so `archived` survives.
+              - archive:
+                  format: lines
+              - label: name_object
+                mapping: |
+                  root = content().string() + "\n"
+
+                  # events/dt=2026-09-27/2026-09-27T20-51-46Z-<uuid>.jsonl.gz
+                  # dt= is a Hive-style partition DuckDB prunes on; the timestamp in the name is
+                  # what the lag query reads. Colons are avoided because they are awkward in S3
+                  # keys and URLs.
+                  let now = now().ts_tz("UTC")
+                  meta key = env("ARCHIVE_PREFIX").or("events/") +
+                    "dt=" + $now.ts_format("2006-01-02") + "/" +
+                    $now.ts_format("2006-01-02T15-04-05") + "Z-" + uuid_v4() + ".jsonl.gz"
+
+              - compress:
+                  algorithm: gzip
+
+              - log:
+                  level: INFO
+                  message: archive
+                  fields_mapping: |
+                    root.archived = @archived
+                    root.bytes = content().length()
+                    root.key = @key

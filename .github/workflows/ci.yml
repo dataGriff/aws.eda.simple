@@ -1,0 +1,48 @@
+# CI is a thin caller of the Taskfile: every step is a `task` a developer can run locally,
+# with tools from mise.toml. Nothing here should be a command that exists only in CI.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, test and validate template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v4.3.0
+        with:
+          cache: true
+
+      - run: task install
+      - run: task ci
+
+  # The whole pipeline, for real, with no AWS credentials and no secrets at all: deploy into
+  # Floci, post events at the webhook, and count what the archiver wrote with DuckDB.
+  floci:
+    name: End-to-end in Floci
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v4.3.0
+        with:
+          cache: true
+
+      - run: task install
+      - run: task local:e2e
+
+      - name: Emulator, archiver logs and containers (on failure)
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs floci-archiver 2>&1 | tail -40 || true
+          docker logs floci-main 2>&1 | tail -80 || true

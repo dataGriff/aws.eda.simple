@@ -1,0 +1,20 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "generator", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["webhook", "generator", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# asserts and hard-coded test secrets are fine in tests; test_archiver_stream.py runs the
+# archiver binary and a moto server as subprocesses and polls them over localhost
+"tests/*" = ["S101", "S105", "S106", "S310", "S603"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"
