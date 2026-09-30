@@ -1,0 +1,29 @@
+# SAM CLI configuration. The WebhookSecret parameter is deliberately NOT stored here;
+# `make deploy` passes it from the WEBHOOK_SECRET environment variable.
+# Note: --parameter-overrides on the CLI replaces this whole list, which is why the
+# Makefile passes BusName and EventSource as well.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "aws-eda-simple"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+region = "eu-west-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+fail_on_empty_changeset = false
+parameter_overrides = "BusName=simple-eda-bus EventSource=com.example.shop"
+
+[default.sync.parameters]
+watch = true
+
+[default.local_invoke.parameters]
+env_vars = "env.json"
