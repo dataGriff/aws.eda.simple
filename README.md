@@ -15,20 +15,23 @@ flowchart LR
     B -- "CatchAllRule<br/>source = com.example.shop" --> C[CloudWatch Logs<br/>/aws/events/simple-eda-bus]
 ```
 
-Everything is deployed with **AWS SAM** from a single `template.yaml`. The Lambda has **no third-party dependencies** (boto3 ships with the runtime).
+Everything is deployed with **Terraform** from the `terraform/` directory. The Lambda has **no third-party dependencies** (boto3 ships with the runtime), so there is no build step: Terraform zips `src/webhook/` itself.
 
 ## Project layout
 
 ```
-template.yaml               SAM template: bus, Lambda + Function URL, IAM, rule, log groups
-samconfig.toml              SAM CLI defaults (stack name, region, non-secret parameters)
-Makefile                    install / lint / test / build / deploy / generate / logs / delete
+terraform/main.tf           Terraform: bus, Lambda + Function URL, IAM, rule, log groups
+terraform/variables.tf      Inputs (name, region, bus name, event source, retention, secret)
+terraform/outputs.tf        Outputs (webhook URL, bus name/ARN, log group)
+terraform/versions.tf       Provider versions and optional S3 backend example
+Makefile                    install / lint / test / validate / plan / deploy / generate / logs / delete
 src/webhook/app.py          Lambda handler and pure helper functions
 generator/generate.py       Fake data generator CLI (runs locally, not deployed)
+scripts/invoke_local.py     Runs the handler in-process with a sample event (no SAM needed)
 tests/                      pytest unit tests (botocore Stubber, no AWS account needed)
-events/post.json            Sample Function URL event for `sam local invoke`
+events/post.json            Sample Function URL event for `make invoke-local`
 env.example.json            Template for local env vars (copy to env.json, git-ignored)
-.github/workflows/ci.yml    Lint + tests + `sam validate --lint`
+.github/workflows/ci.yml    Lint + tests + `terraform fmt -check` + `terraform validate`
 ```
 
 ## Event contract
@@ -65,7 +68,7 @@ Each event becomes one EventBridge entry: `source` is fixed per deployment (`Eve
 ## Prerequisites
 
 - An AWS account and credentials configured for the AWS CLI
-- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and [Terraform](https://developer.hashicorp.com/terraform/install) 1.5 or newer
 - Python 3.12 (3.11 also works for local tests) and `make`
 
 ## Setup
@@ -80,12 +83,23 @@ make lint test          # ruff + 60-odd unit tests, no AWS needed
 
 ```bash
 export WEBHOOK_SECRET=$(openssl rand -hex 24)   # keep this, the generator needs it
-make deploy                                     # sam build + sam deploy
-make outputs                                    # shows WebhookUrl, bus name, log group
+make plan                                       # terraform init + plan (11 resources on first run)
+make deploy                                     # terraform apply -auto-approve
+make outputs                                    # shows webhook_url, bus name, log group
 ```
 
-`make deploy` refuses to run without `WEBHOOK_SECRET` set. Override the defaults with make variables, e.g. `make deploy REGION=us-east-1 BUS_NAME=my-bus`.
-For a first-time interactive deploy you can also use `make deploy-guided`.
+`make deploy` refuses to run without `WEBHOOK_SECRET` set; it is passed to Terraform as the sensitive `webhook_secret` variable via `TF_VAR_webhook_secret`, so it never lands in a file. Override the defaults with make variables, e.g. `make deploy REGION=us-east-1 BUS_NAME=my-bus NAME=my-stack`.
+
+You can also drive Terraform directly:
+
+```bash
+cd terraform
+terraform init
+TF_VAR_webhook_secret=$WEBHOOK_SECRET terraform apply -var bus_name=my-bus
+terraform output -raw webhook_url
+```
+
+State is local (`terraform/terraform.tfstate`, git-ignored). For anything shared, uncomment and fill in the S3 backend block in `terraform/versions.tf`. `terraform init` also writes `terraform/.terraform.lock.hcl`; commit it once you have run init so everyone uses the same provider builds.
 
 ## Run the fake data generator
 
@@ -140,26 +154,28 @@ curl -si -X POST "$URL" -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
 
 ## Local development
 
-- `make lint`, `make fmt`, `make test`, `make validate` (`sam validate --lint`).
-- `make invoke-local` runs the handler in a local container with `events/post.json`. Copy `env.example.json` to `env.json` first. Note that the handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
-- `sam local start-api` does **not** serve Lambda Function URLs, so it is not useful here.
+- `make lint` (ruff + `terraform fmt -check`), `make fmt`, `make test`, `make validate` (`terraform validate`).
+- `make invoke-local` runs the handler in-process (`scripts/invoke_local.py`) with `events/post.json`. Copy `env.example.json` to `env.json` first. Note that the handler still calls **real** EventBridge with your local credentials, so the bus must already exist (deploy first) or you will get a `500`.
+- Changing anything in `src/webhook/` changes the zip hash, so the next `make deploy` redeploys the function automatically.
 
 ## Security notes
 
 - The Function URL is public; the shared secret header is the only gate. Comparison is constant-time and the secret is never logged. Rotate it by redeploying with a new `WEBHOOK_SECRET`.
-- The secret is stored as a Lambda environment variable (`NoEcho` in CloudFormation). For production, move it to SSM Parameter Store or Secrets Manager, or switch the Function URL to `AuthType: AWS_IAM`.
-- The function's IAM role can only call `events:PutEvents` on this one bus.
+- The secret is stored as a Lambda environment variable. It is marked `sensitive` in Terraform so it is redacted from plan output, but it is still written to the state file in plain text: protect the state (encrypted S3 backend) accordingly. For production, move it to SSM Parameter Store or Secrets Manager, or switch the Function URL to `authorization_type = "AWS_IAM"`.
+- The function's IAM role can only call `events:PutEvents` on this one bus and write to its own log group.
 - If you need WAF, throttling or custom domains, put an API Gateway HTTP API in front of the function instead of a Function URL.
 
 ## Tear down
 
 ```bash
-make delete             # sam delete, removes the stack including log groups and the resource policy
+make delete             # terraform destroy, removes everything including log groups and the resource policy
 ```
 
 ## How it works (implementation notes)
 
 - `src/webhook/app.py` is split into small pure functions (`is_authorized`, `parse_body`, `validate_event`, `to_entry`, `chunk`, `put_events`) so the whole request path is unit-tested with botocore's `Stubber`, including EventBridge partial failures.
 - `PutEvents` accepts at most 10 entries per call, so requests are chunked; failures are reported with their index in the original request.
-- The CloudWatch Logs target needs an `AWS::Logs::ResourcePolicy` allowing `events.amazonaws.com` to write to the log group. Without it the rule deploys but silently delivers nothing.
+- The CloudWatch Logs target needs an `aws_cloudwatch_log_resource_policy` allowing `events.amazonaws.com` to write to the log group. Without it the rule deploys but silently delivers nothing.
+- The Lambda log group is created explicitly (with retention) and the function depends on it, so Lambda never auto-creates an unmanaged, never-expiring group.
+- The `lambda:InvokeFunctionUrl` permission for principal `*` (which SAM added implicitly) is an explicit `aws_lambda_permission`; without it the public URL returns `403`.
 - `tests/test_generator.py` feeds the generator's output through the Lambda's own `validate_event`, so the two sides of the contract cannot drift apart.

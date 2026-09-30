@@ -7,11 +7,21 @@ venv/
 .ruff_cache/
 *.egg-info/
 
-# SAM / AWS
-.aws-sam/
-samconfig.local.toml
-env.json
-packaged.yaml
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+terraform.tfvars
+*.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform/.build/
 
 # Local secrets / env
+env.json
 .env

@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) to override defaults, or pass -var / TF_VAR_* instead.
+# Do NOT put webhook_secret here; export TF_VAR_webhook_secret in your shell.
+
+# name               = "aws-eda-simple"
+# aws_region         = "eu-west-1"
+# bus_name           = "simple-eda-bus"
+# event_source       = "com.example.shop"
+# log_retention_days = 7

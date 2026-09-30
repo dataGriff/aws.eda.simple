@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    name: Lint, test and validate template
+    name: Lint, test and validate Terraform
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,9 +32,15 @@ jobs:
       - name: Unit tests
         run: pytest
 
-      - uses: aws-actions/setup-sam@v2
+      - uses: hashicorp/setup-terraform@v3
         with:
-          use-installer: true
+          terraform_version: "1.9.8"
 
-      - name: Validate SAM template
-        run: sam validate --lint --region eu-west-1
+      - name: Terraform fmt
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=terraform validate
